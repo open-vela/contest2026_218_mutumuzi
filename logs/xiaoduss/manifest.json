@@ -3,7 +3,7 @@
   "team_id": "contest2026_218_mutumuzi",
   "github_login": "xiaoduss",
   "generator": "claude-code-collector@1.2.0",
-  "updated_at": "2026-08-14T13:53:38.995Z",
+  "updated_at": "2026-08-14T14:03:32.234815+00:00",
   "sessions": [
     {
       "session_id": "c99c21ac-7772-4e2d-8633-ab93cc93400d",
@@ -25,6 +25,18 @@
       "event_count": 63,
       "raw_event_count": 81,
       "file_path": "logs/xiaoduss/2026-08-14/claude-code__a141f79d-6f81-4d2f-ad28-f8f36ac7b768.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "model": "deepseek-v4-pro"
+    },
+    {
+      "session_id": "420609f3-c130-4de8-b2fb-a6a1127d50e9",
+      "tool": "claude-code",
+      "started_at": "2026-08-13T12:00:35.590Z",
+      "last_event_at": "2026-08-13T15:01:27.858Z",
+      "event_count": 542,
+      "raw_event_count": 886,
+      "file_path": "logs/xiaoduss/2026-08-13/claude-code__420609f3-c130-4de8-b2fb-a6a1127d50e9.jsonl",
       "collection_mode": "cli",
       "health": "ok",
       "model": "deepseek-v4-pro"
