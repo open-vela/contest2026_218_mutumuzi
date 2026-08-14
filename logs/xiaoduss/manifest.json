@@ -1,0 +1,33 @@
+{
+  "schema_version": "1.0",
+  "team_id": "contest2026_218_mutumuzi",
+  "github_login": "xiaoduss",
+  "generator": "claude-code-collector@1.2.0",
+  "updated_at": "2026-08-14T13:53:38.995Z",
+  "sessions": [
+    {
+      "session_id": "c99c21ac-7772-4e2d-8633-ab93cc93400d",
+      "tool": "claude-code",
+      "started_at": "2026-07-16T05:19:48.869Z",
+      "last_event_at": "2026-07-16T05:19:48.869Z",
+      "event_count": 49,
+      "raw_event_count": 66,
+      "file_path": "logs/xiaoduss/2026-07-16/claude-code__c99c21ac-7772-4e2d-8633-ab93cc93400d.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "model": "deepseek-v4-pro"
+    },
+    {
+      "session_id": "a141f79d-6f81-4d2f-ad28-f8f36ac7b768",
+      "tool": "claude-code",
+      "started_at": "2026-08-14T13:53:38.992Z",
+      "last_event_at": "2026-08-14T13:53:38.992Z",
+      "event_count": 63,
+      "raw_event_count": 81,
+      "file_path": "logs/xiaoduss/2026-08-14/claude-code__a141f79d-6f81-4d2f-ad28-f8f36ac7b768.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "model": "deepseek-v4-pro"
+    }
+  ]
+}
