@@ -1,0 +1,165 @@
+diff --git a/src/agent_main.c b/src/agent_main.c
+index 9d676c2..857f87e 100644
+--- a/src/agent_main.c
++++ b/src/agent_main.c
+@@ -206,6 +206,60 @@ static void* network_watch_task(void* arg)
+     return NULL;
+ }
+ 
++#ifdef CONFIG_AI_AGENT_BLE_GATT
++/**
++ * Runs in a background thread: initializes the BLE GATT channel.
++ * Fast retries first, then keeps trying every 30s so BLE comes up
++ * whenever the BT service (bluetoothd) becomes ready.
++ */
++static void* ble_gatt_init_task(void* arg)
++{
++    (void)arg;
++    extern void ble_cmd_handler_recv(const uint8_t* data, uint16_t len,
++        void* user_data);
++
++    ble_gatt_config_t ble_cfg = {
++        .device_name = "VelaClaw",
++        .recv_cb = ble_cmd_handler_recv,
++    };
++
++    int rc = -1;
++    int attempts = 0;
++
++    while (rc < 0 && !g_shutdown_requested) {
++        /* Ensure adapter LE is enabled before GATT init */
++        bt_instance_t* bt_ins = bluetooth_get_instance();
++        if (bt_ins) {
++            bt_adapter_state_t state = bt_adapter_get_state(bt_ins);
++            if (state < BT_ADAPTER_STATE_BLE_ON) {
++                syslog(LOG_INFO, "[%s] BT not ready (state=%d), enabling LE...\n",
++                    TAG, (int)state);
++                bt_adapter_enable_le(bt_ins);
++                sleep(2);
++            }
++        }
++
++        rc = ble_gatt_init(&ble_cfg);
++        if (rc == 0) {
++            syslog(LOG_INFO, "[%s] ble_gatt init OK (attempt %d)\n",
++                TAG, attempts + 1);
++            break;
++        }
++
++        /* 5 fast retries (3s), then retry every 30s in the background.
++         * Log only every 10th slow attempt to avoid console spam. */
++        if (attempts < 5 || attempts % 10 == 0) {
++            syslog(LOG_WARNING, "[%s] ble_gatt_init attempt %d failed: %d\n",
++                TAG, attempts + 1, rc);
++        }
++        sleep(attempts < 5 ? 3 : 30);
++        attempts++;
++    }
++
++    return NULL;
++}
++#endif
++
+ #ifdef CONFIG_FEATURE_SYSTEM_VELACLAW
+ /* -- Quickapp mqueue IPC (cross-process bridge) --------------- */
+ 
+@@ -644,42 +698,14 @@ int ai_agent_main(int argc, char* argv[])
+ #endif
+ 
+ #ifdef CONFIG_AI_AGENT_BLE_GATT
+-    /* BLE GATT: ensure adapter enabled, then init with retries */
+-    {
+-        extern void ble_cmd_handler_recv(const uint8_t* data, uint16_t len,
+-            void* user_data);
+-        bt_instance_t* bt_ins = bluetooth_get_instance();
+-        if (bt_ins) {
+-            bt_adapter_state_t state = bt_adapter_get_state(bt_ins);
+-            if (state < BT_ADAPTER_STATE_BLE_ON) {
+-                syslog(LOG_INFO, "[%s] BT not ready (state=%d), enabling LE...\n",
+-                    TAG, (int)state);
+-                bt_adapter_enable_le(bt_ins);
+-                sleep(2);
+-            }
+-        }
+-
+-        ble_gatt_config_t ble_cfg = {
+-            .device_name = "VelaClaw",
+-            .recv_cb = ble_cmd_handler_recv,
+-        };
+-        int rc = -1;
+-        int attempts = 0;
+-        while (rc < 0 && attempts < 5) {
+-            rc = ble_gatt_init(&ble_cfg);
+-            if (rc < 0) {
+-                syslog(LOG_WARNING, "[%s] ble_gatt_init attempt %d failed: %d\n",
+-                    TAG, attempts + 1, rc);
+-                sleep(3);
+-            }
+-            attempts++;
+-        }
+-        if (rc == 0) {
+-            BOOT_LOG(&t0, "P5", "ble_gatt init OK");
+-        } else {
+-            BOOT_LOG(&t0, "P5", "ble_gatt FAILED after retries");
+-        }
++    /* BLE GATT: init in a background task with retries so a slow BT
++     * service does not block agent startup (was blocking up to 15s here). */
++    if (agent_task_create(ble_gatt_init_task, "ble_gatt",
++            AGENT_OUTBOUND_STACK, NULL,
++            AGENT_OUTBOUND_PRIO) != OK) {
++        syslog(LOG_WARNING, "[%s] Failed to start ble_gatt init task\n", TAG);
+     }
++    BOOT_LOG(&t0, "P5", "ble_gatt init task started (async)");
+ #endif
+ 
+     /* Network watcher thread: reconnect + wait + start net services */
+diff --git a/src/infra/ble_gatt.c b/src/infra/ble_gatt.c
+index 807c924..83bc41c 100644
+--- a/src/infra/ble_gatt.c
++++ b/src/infra/ble_gatt.c
+@@ -29,6 +29,9 @@
+ #include <syslog.h>
+ #include <unistd.h>
+ 
++#include <sys/socket.h>
++#include <sys/un.h>
++
+ #include <advertiser_data.h>
+ #include <bluetooth.h>
+ #include <bt_addr.h>
+@@ -350,7 +353,7 @@ static int adv_start(void)
+     /* Set advertising parameters */
+     ble_adv_params_t params;
+     memset(&params, 0, sizeof(params));
+-    params.adv_type = BT_LE_ADV_IND; /* Connectable undirected */
++    params.adv_type = BT_LE_LEGACY_ADV_IND; /* Legacy connectable undirected */
+     params.own_addr_type = BT_LE_ADDR_TYPE_PUBLIC;
+     params.interval = BLE_GATT_ADV_INTERVAL;
+     params.channel_map = BT_LE_ADV_CHANNEL_DEFAULT;
+@@ -468,7 +471,26 @@ int ble_gatt_init(const ble_gatt_config_t* config)
+     /* Get BT instance */
+     g_gatt.bt_ins = bluetooth_get_instance();
+     if (!g_gatt.bt_ins) {
++        static int diag_count = 0;
+         printf("[ble_gatt] FAILED: no BT instance\n");
++        /* Probe: replicate the socket connect to get the real errno.
++         * Only print on the first few attempts to avoid log spam. */
++        if (diag_count++ < 3) {
++            int fd = socket(PF_LOCAL, SOCK_STREAM, 0);
++            if (fd < 0) {
++                printf("[ble_gatt] diag: socket() failed errno=%d (%s)\n",
++                    errno, strerror(errno));
++            } else {
++                struct sockaddr_un u;
++                memset(&u, 0, sizeof(u));
++                u.sun_family = AF_LOCAL;
++                snprintf(u.sun_path, sizeof(u.sun_path), "bt:bluetooth");
++                int rc = connect(fd, (struct sockaddr*)&u, sizeof(u));
++                printf("[ble_gatt] diag: connect() rc=%d errno=%d (%s)\n",
++                    rc, errno, strerror(errno));
++                close(fd);
++            }
++        }
+         goto fail;
+     }
+     printf("[ble_gatt] step 2: register GATT server\n");
