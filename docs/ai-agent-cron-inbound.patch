@@ -1,0 +1,25 @@
+diff --git a/src/infra/cron_service.c b/src/infra/cron_service.c
+index 34509d7..4edd921 100644
+--- a/src/infra/cron_service.c
++++ b/src/infra/cron_service.c
+@@ -363,7 +363,10 @@ static void cron_fire_job(cron_job_t* job, time_t now)
+             }
+         }
+     } else {
+-        /* Plain reminder — push directly to outbound */
++        /* Plain reminder — feed into the agent inbound queue so the
++         * message goes through skill matching + LLM processing
++         * (e.g. the daily briefing skill triggered by "早安简报时间到了").
++         * The reply, if any, is routed back out on the same channel. */
+         agent_msg_t msg;
+         memset(&msg, 0, sizeof(msg));
+         strncpy(msg.channel, job->channel, sizeof(msg.channel) - 1);
+@@ -371,7 +374,7 @@ static void cron_fire_job(cron_job_t* job, time_t now)
+         msg.content = strdup(job->message);
+ 
+         if (msg.content) {
+-            int err = message_bus_push_outbound(&msg);
++            int err = message_bus_push_inbound(&msg);
+             if (err != OK) {
+                 syslog(LOG_WARNING, "[%s] Failed to push cron message\n", TAG);
+                 free(msg.content);
