@@ -108,8 +108,8 @@ git apply ../contest2026_218_mutumuzi/docs/firmware-fixes-board-defconfig-202608
 | 白屏修复（mediad alsasink） | ✅ 完成，v11 验证 | docs/firmware-fixes-* |
 | BLE 广播/栈修复 | ✅ 完成 | docs/ai-agent-ble-gatt-fixes-* |
 | chunked 读取修复 | ✅ 完成（公共仓 PR #27 待合） | docs/ai-agent-chunked-fix.patch |
-| 简报上屏（LVGL 卡片） | 🚧 开发中（2026-09-08 收尾阶段） | — |
-| TTS 语音播报 | ⚠️ 部分：音频栈已修复，云端 TTS 引擎未接入（需账号密钥）；本地 PCM→喇叭通路验证中 | logs/2026-09-08 |
+| 简报上屏（LVGL 卡片） | ✅ 完成，v13 全链路实测（ask → LLM → mqueue → 卡片刷新 + 非简报不上屏回归） | logs/2026-09-10；docs/ai-agent-screen-briefing-mq.patch |
+| TTS 语音播报 | ⚠️ 部分：音频软件链路已修复并验证（mediad→alsasink→codec 全流程日志级通过）；云端 TTS 引擎未接入（需火山方舟账号密钥）；实机扬声器需外接（HS 板载仅麦克风，HPOUT 为 3.5mm 耳机孔） | logs/2026-09-08~09 |
 | 屏幕常驻 UI（时间/温湿度/距离卡片） | ✅ 板载 luncher 原生功能，正常 | 实拍见提交材料 |
 
-> 诚实说明：本作品**未使用**示例骨架 app/board/quickapp；天气检索质量（Tavily 页面解析）与"简报上屏"两项处于"可用但待打磨"状态，均已如实标注。代码行数不是亮点，真机全链路与系统性排障才是。
+> 诚实说明：本作品**未使用**示例骨架 app/board/quickapp；天气检索质量（Tavily 页面解析）处于"可用但待打磨"状态；TTS 云端引擎未接入（无密钥）且硬件需外接扬声器——均已如实标注。代码行数不是亮点，真机全链路与系统性排障才是。演示视频拍摄中（周末补充）。
