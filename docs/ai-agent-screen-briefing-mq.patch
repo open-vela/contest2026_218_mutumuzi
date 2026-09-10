@@ -1,0 +1,113 @@
+diff --git a/src/core/agent_loop.c b/src/core/agent_loop.c
+index 3d9dec3..323ca04 100644
+--- a/src/core/agent_loop.c
++++ b/src/core/agent_loop.c
+@@ -46,12 +46,27 @@
+ 
+ #include "cJSON.h"
+ 
++#include <errno.h>
++#include <fcntl.h>
++#include <mqueue.h>
++
+ static const char* TAG = "agent";
+ 
+ #define TOOL_OUTPUT_SIZE (8 * 1024)
+ #define TOOL_OUTPUT_SIZE_LARGE (16 * 1024)
+ #define TOOL_OUTPUT_SIZE_MIN (2 * 1024)
+ 
++/* ── Screen briefing card mqueue (ai_agent -> luncher_mini) ──
++ * Cross-process POSIX mqueue. Name has NO leading '/' (board config
++ * CONFIG_FS_MQUEUE_NAME_INITIAL_SLASH is off -> /var/mqueue/<name>).
++ * Constants MUST match luncher_mini.c BRIEFING_MQ_*. */
++#define SCREEN_MQ_NAME        "briefing"
++#define SCREEN_MQ_MAXMSG      4
++#define SCREEN_MQ_MSGSIZE     1024    /* == CONFIG_MQ_MAXMSGSIZE */
++#define SCREEN_MQ_PAYLOAD_MAX 1023    /* UTF-8 safe cap incl. NUL */
++static mqd_t s_screen_mq = (mqd_t)-1;
++static int   s_screen_mq_open_tried;
++
+ /* ── Forward declarations ──────────────────────────────────── */
+ 
+ static char* handle_slash_note(const agent_msg_t* msg);
+@@ -838,12 +853,80 @@ static char* force_finish_reply(const char* system_prompt,
+     return strip_tool_call_markup(result);
+ }
+ 
++/* ── Screen briefing push (RAM-only, never blocks the loop) ── */
++
++/* Only "briefing-class" requests (cron morning-briefing message
++ * "早安简报时间到了", ask/voice "早间简报", /daily rewrite etc.) push
++ * the reply to the screen card. Known edge: meta questions containing
++ * "简报" also match - acceptable. */
++static bool screen_briefing_requested(const char* req)
++{
++    return req && strstr(req, "简报") != NULL;
++}
++
++/* UTF-8 safe truncate: drop bytes of a split character at the tail. */
++static void screen_utf8_truncate(char* s, size_t cap)
++{
++    size_t len = strlen(s);
++    if (len <= cap) {
++        return;
++    }
++
++    char* p = s + cap;
++    while (p > s && ((unsigned char)p[-1] & 0xC0) == 0x80) {
++        p--;    /* continuation bytes of a cut char */
++    }
++
++    if (p > s && (unsigned char)p[-1] >= 0xC0) {
++        p--;    /* lead byte of the cut char */
++    }
++
++    *p = '\0';
++}
++
++/* Lazy open once + O_NONBLOCK send. Any failure is silent (syslog),
++ * never blocks or breaks the agent main loop. */
++static void screen_briefing_mq_send(const char* text)
++{
++    if (!text || !text[0]) {
++        return;
++    }
++
++    if (!s_screen_mq_open_tried) {
++        s_screen_mq_open_tried = 1;
++        struct mq_attr attr = {
++            .mq_maxmsg = SCREEN_MQ_MAXMSG,
++            .mq_msgsize = SCREEN_MQ_MSGSIZE,
++        };
++        s_screen_mq = mq_open(SCREEN_MQ_NAME,
++                              O_WRONLY | O_CREAT | O_NONBLOCK, 0666, &attr);
++        if (s_screen_mq == (mqd_t)-1) {
++            syslog(LOG_WARNING, "[%s] screen mq_open failed: %d\n",
++                   TAG, errno);
++            return;
++        }
++    }
++
++    char buf[SCREEN_MQ_MSGSIZE];
++    strncpy(buf, text, SCREEN_MQ_MSGSIZE - 1);
++    buf[SCREEN_MQ_MSGSIZE - 1] = '\0';
++    screen_utf8_truncate(buf, SCREEN_MQ_PAYLOAD_MAX);
++
++    if (mq_send(s_screen_mq, buf, strlen(buf) + 1, 0) != 0) {
++        /* EAGAIN (screen side not draining) or other: log only */
++        syslog(LOG_DEBUG, "[%s] screen mq_send dropped: %d\n", TAG, errno);
++    }
++}
++
+ /* ── Extracted: dispatch response to outbound bus ─────────── */
+ 
+ static void dispatch_response(const agent_msg_t* msg,
+     char* final_text)
+ {
+     if (final_text && final_text[0]) {
++        if (screen_briefing_requested(msg->content)) {
++            screen_briefing_mq_send(final_text);
++        }
+         session_append(msg->chat_id, "user", msg->content);
+         session_append(msg->chat_id, "assistant", final_text);
+ 
