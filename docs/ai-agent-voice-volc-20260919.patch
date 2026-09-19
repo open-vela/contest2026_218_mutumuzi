@@ -1,0 +1,1054 @@
+diff --git a/.built b/.built
+deleted file mode 100644
+index e69de29..0000000
+diff --git a/include/agent_config.h b/include/agent_config.h
+index 711bb6d..bbf44b0 100644
+--- a/include/agent_config.h
++++ b/include/agent_config.h
+@@ -337,14 +337,24 @@
+ #define AGENT_DOUBAO_TTS_HOST "openspeech.bytedance.com"
+ #define AGENT_DOUBAO_TTS_PORT "443"
+ #define AGENT_DOUBAO_TTS_V3_PATH "/api/v3/tts/unidirectional"
+-#define AGENT_DOUBAO_TTS_RESOURCE "volc.service_type.10029"
++/* 2026-09-17：1.0 资源号 volc.service_type.10029 对本账号未授予（控制台
++ * 开通需企业认证，报价 2000 元/月），改用账号已开通的豆包语音合成 2.0。
++ * 资源号必须与音色版本匹配：seed-tts-2.0 配 *_uranus_bigtts / saturn_* 音色，
++ * 配 1.0 音色会返回 55000000 "resource ID is mismatched with speaker"。 */
++#define AGENT_DOUBAO_TTS_RESOURCE "seed-tts-2.0"
+ 
+ /* Doubao streaming ASR WebSocket API (V2) */
+ #define AGENT_DOUBAO_ASR_HOST "openspeech.bytedance.com"
+ #define AGENT_DOUBAO_ASR_PORT "443"
+-#define AGENT_DOUBAO_ASR_WS_PATH "/api/v2/asr"
+-
+-/* Default ASR cluster (streaming, common Chinese) */
++/* 2026-09-18：从 v2 迁到 v3。本账号只开通了「流式语音识别大模型-小时版」，
++ * 其资源号 volc.bigasr.sauc.duration 只在 v3 接口上可用；老 v2 接口
++ * （cluster=volcengine_streaming_common）对应老资源 volc.streamingasr.common.cn，
++ * 本账号未开通，会报 403/45000030 requested resource not granted。
++ * v3 鉴权用双头 X-Api-App-Key + X-Api-Access-Key，不再用 Authorization: Bearer; */
++#define AGENT_DOUBAO_ASR_WS_PATH "/api/v3/sauc/bigmodel_async"
++#define AGENT_DOUBAO_ASR_RESOURCE "volc.bigasr.sauc.duration"
++
++/* 旧 v2 接口的 cluster（保留仅作参考，当前不走这条路） */
+ #define AGENT_DOUBAO_ASR_CLUSTER "volcengine_streaming_common"
+ 
+ /* Audio device paths (platform-specific) */
+@@ -381,7 +391,9 @@
+ #define AGENT_CFG_KEY_VOLC_ASR_CLUSTER "volc_asr_cluster"
+ 
+ /* Default TTS speaker and cluster */
+-#define AGENT_VOICE_DEFAULT_SPEAKER "zh_male_beijingxiaoye_emo_v2_mars_bigtts"
++/* 默认音色必须是 2.0 音色（_uranus_bigtts / saturn_*），与上面的资源号配套。
++ * 运行时可用 set_volc_speaker 或 config.json 的 volc_speaker 覆盖，无需重烧。 */
++#define AGENT_VOICE_DEFAULT_SPEAKER "zh_male_m191_uranus_bigtts"
+ #define AGENT_VOICE_DEFAULT_CLUSTER "volcano_tts"
+ 
+ /* WebSocket TTS output sample rate (big-model voices output 24kHz) */
+diff --git a/src/agent_main.c b/src/agent_main.c
+index 9d676c2..857f87e 100644
+--- a/src/agent_main.c
++++ b/src/agent_main.c
+@@ -206,6 +206,60 @@ static void* network_watch_task(void* arg)
+     return NULL;
+ }
+ 
++#ifdef CONFIG_AI_AGENT_BLE_GATT
++/**
++ * Runs in a background thread: initializes the BLE GATT channel.
++ * Fast retries first, then keeps trying every 30s so BLE comes up
++ * whenever the BT service (bluetoothd) becomes ready.
++ */
++static void* ble_gatt_init_task(void* arg)
++{
++    (void)arg;
++    extern void ble_cmd_handler_recv(const uint8_t* data, uint16_t len,
++        void* user_data);
++
++    ble_gatt_config_t ble_cfg = {
++        .device_name = "VelaClaw",
++        .recv_cb = ble_cmd_handler_recv,
++    };
++
++    int rc = -1;
++    int attempts = 0;
++
++    while (rc < 0 && !g_shutdown_requested) {
++        /* Ensure adapter LE is enabled before GATT init */
++        bt_instance_t* bt_ins = bluetooth_get_instance();
++        if (bt_ins) {
++            bt_adapter_state_t state = bt_adapter_get_state(bt_ins);
++            if (state < BT_ADAPTER_STATE_BLE_ON) {
++                syslog(LOG_INFO, "[%s] BT not ready (state=%d), enabling LE...\n",
++                    TAG, (int)state);
++                bt_adapter_enable_le(bt_ins);
++                sleep(2);
++            }
++        }
++
++        rc = ble_gatt_init(&ble_cfg);
++        if (rc == 0) {
++            syslog(LOG_INFO, "[%s] ble_gatt init OK (attempt %d)\n",
++                TAG, attempts + 1);
++            break;
++        }
++
++        /* 5 fast retries (3s), then retry every 30s in the background.
++         * Log only every 10th slow attempt to avoid console spam. */
++        if (attempts < 5 || attempts % 10 == 0) {
++            syslog(LOG_WARNING, "[%s] ble_gatt_init attempt %d failed: %d\n",
++                TAG, attempts + 1, rc);
++        }
++        sleep(attempts < 5 ? 3 : 30);
++        attempts++;
++    }
++
++    return NULL;
++}
++#endif
++
+ #ifdef CONFIG_FEATURE_SYSTEM_VELACLAW
+ /* -- Quickapp mqueue IPC (cross-process bridge) --------------- */
+ 
+@@ -644,42 +698,14 @@ int ai_agent_main(int argc, char* argv[])
+ #endif
+ 
+ #ifdef CONFIG_AI_AGENT_BLE_GATT
+-    /* BLE GATT: ensure adapter enabled, then init with retries */
+-    {
+-        extern void ble_cmd_handler_recv(const uint8_t* data, uint16_t len,
+-            void* user_data);
+-        bt_instance_t* bt_ins = bluetooth_get_instance();
+-        if (bt_ins) {
+-            bt_adapter_state_t state = bt_adapter_get_state(bt_ins);
+-            if (state < BT_ADAPTER_STATE_BLE_ON) {
+-                syslog(LOG_INFO, "[%s] BT not ready (state=%d), enabling LE...\n",
+-                    TAG, (int)state);
+-                bt_adapter_enable_le(bt_ins);
+-                sleep(2);
+-            }
+-        }
+-
+-        ble_gatt_config_t ble_cfg = {
+-            .device_name = "VelaClaw",
+-            .recv_cb = ble_cmd_handler_recv,
+-        };
+-        int rc = -1;
+-        int attempts = 0;
+-        while (rc < 0 && attempts < 5) {
+-            rc = ble_gatt_init(&ble_cfg);
+-            if (rc < 0) {
+-                syslog(LOG_WARNING, "[%s] ble_gatt_init attempt %d failed: %d\n",
+-                    TAG, attempts + 1, rc);
+-                sleep(3);
+-            }
+-            attempts++;
+-        }
+-        if (rc == 0) {
+-            BOOT_LOG(&t0, "P5", "ble_gatt init OK");
+-        } else {
+-            BOOT_LOG(&t0, "P5", "ble_gatt FAILED after retries");
+-        }
++    /* BLE GATT: init in a background task with retries so a slow BT
++     * service does not block agent startup (was blocking up to 15s here). */
++    if (agent_task_create(ble_gatt_init_task, "ble_gatt",
++            AGENT_OUTBOUND_STACK, NULL,
++            AGENT_OUTBOUND_PRIO) != OK) {
++        syslog(LOG_WARNING, "[%s] Failed to start ble_gatt init task\n", TAG);
+     }
++    BOOT_LOG(&t0, "P5", "ble_gatt init task started (async)");
+ #endif
+ 
+     /* Network watcher thread: reconnect + wait + start net services */
+diff --git a/src/core/agent_loop.c b/src/core/agent_loop.c
+index 3d9dec3..323ca04 100644
+--- a/src/core/agent_loop.c
++++ b/src/core/agent_loop.c
+@@ -46,12 +46,27 @@
+ 
+ #include "cJSON.h"
+ 
++#include <errno.h>
++#include <fcntl.h>
++#include <mqueue.h>
++
+ static const char* TAG = "agent";
+ 
+ #define TOOL_OUTPUT_SIZE (8 * 1024)
+ #define TOOL_OUTPUT_SIZE_LARGE (16 * 1024)
+ #define TOOL_OUTPUT_SIZE_MIN (2 * 1024)
+ 
++/* ── Screen briefing card mqueue (ai_agent -> luncher_mini) ──
++ * Cross-process POSIX mqueue. Name has NO leading '/' (board config
++ * CONFIG_FS_MQUEUE_NAME_INITIAL_SLASH is off -> /var/mqueue/<name>).
++ * Constants MUST match luncher_mini.c BRIEFING_MQ_*. */
++#define SCREEN_MQ_NAME        "briefing"
++#define SCREEN_MQ_MAXMSG      4
++#define SCREEN_MQ_MSGSIZE     1024    /* == CONFIG_MQ_MAXMSGSIZE */
++#define SCREEN_MQ_PAYLOAD_MAX 1023    /* UTF-8 safe cap incl. NUL */
++static mqd_t s_screen_mq = (mqd_t)-1;
++static int   s_screen_mq_open_tried;
++
+ /* ── Forward declarations ──────────────────────────────────── */
+ 
+ static char* handle_slash_note(const agent_msg_t* msg);
+@@ -838,12 +853,80 @@ static char* force_finish_reply(const char* system_prompt,
+     return strip_tool_call_markup(result);
+ }
+ 
++/* ── Screen briefing push (RAM-only, never blocks the loop) ── */
++
++/* Only "briefing-class" requests (cron morning-briefing message
++ * "早安简报时间到了", ask/voice "早间简报", /daily rewrite etc.) push
++ * the reply to the screen card. Known edge: meta questions containing
++ * "简报" also match - acceptable. */
++static bool screen_briefing_requested(const char* req)
++{
++    return req && strstr(req, "简报") != NULL;
++}
++
++/* UTF-8 safe truncate: drop bytes of a split character at the tail. */
++static void screen_utf8_truncate(char* s, size_t cap)
++{
++    size_t len = strlen(s);
++    if (len <= cap) {
++        return;
++    }
++
++    char* p = s + cap;
++    while (p > s && ((unsigned char)p[-1] & 0xC0) == 0x80) {
++        p--;    /* continuation bytes of a cut char */
++    }
++
++    if (p > s && (unsigned char)p[-1] >= 0xC0) {
++        p--;    /* lead byte of the cut char */
++    }
++
++    *p = '\0';
++}
++
++/* Lazy open once + O_NONBLOCK send. Any failure is silent (syslog),
++ * never blocks or breaks the agent main loop. */
++static void screen_briefing_mq_send(const char* text)
++{
++    if (!text || !text[0]) {
++        return;
++    }
++
++    if (!s_screen_mq_open_tried) {
++        s_screen_mq_open_tried = 1;
++        struct mq_attr attr = {
++            .mq_maxmsg = SCREEN_MQ_MAXMSG,
++            .mq_msgsize = SCREEN_MQ_MSGSIZE,
++        };
++        s_screen_mq = mq_open(SCREEN_MQ_NAME,
++                              O_WRONLY | O_CREAT | O_NONBLOCK, 0666, &attr);
++        if (s_screen_mq == (mqd_t)-1) {
++            syslog(LOG_WARNING, "[%s] screen mq_open failed: %d\n",
++                   TAG, errno);
++            return;
++        }
++    }
++
++    char buf[SCREEN_MQ_MSGSIZE];
++    strncpy(buf, text, SCREEN_MQ_MSGSIZE - 1);
++    buf[SCREEN_MQ_MSGSIZE - 1] = '\0';
++    screen_utf8_truncate(buf, SCREEN_MQ_PAYLOAD_MAX);
++
++    if (mq_send(s_screen_mq, buf, strlen(buf) + 1, 0) != 0) {
++        /* EAGAIN (screen side not draining) or other: log only */
++        syslog(LOG_DEBUG, "[%s] screen mq_send dropped: %d\n", TAG, errno);
++    }
++}
++
+ /* ── Extracted: dispatch response to outbound bus ─────────── */
+ 
+ static void dispatch_response(const agent_msg_t* msg,
+     char* final_text)
+ {
+     if (final_text && final_text[0]) {
++        if (screen_briefing_requested(msg->content)) {
++            screen_briefing_mq_send(final_text);
++        }
+         session_append(msg->chat_id, "user", msg->content);
+         session_append(msg->chat_id, "assistant", final_text);
+ 
+diff --git a/src/infra/ble_gatt.c b/src/infra/ble_gatt.c
+index 807c924..83bc41c 100644
+--- a/src/infra/ble_gatt.c
++++ b/src/infra/ble_gatt.c
+@@ -29,6 +29,9 @@
+ #include <syslog.h>
+ #include <unistd.h>
+ 
++#include <sys/socket.h>
++#include <sys/un.h>
++
+ #include <advertiser_data.h>
+ #include <bluetooth.h>
+ #include <bt_addr.h>
+@@ -350,7 +353,7 @@ static int adv_start(void)
+     /* Set advertising parameters */
+     ble_adv_params_t params;
+     memset(&params, 0, sizeof(params));
+-    params.adv_type = BT_LE_ADV_IND; /* Connectable undirected */
++    params.adv_type = BT_LE_LEGACY_ADV_IND; /* Legacy connectable undirected */
+     params.own_addr_type = BT_LE_ADDR_TYPE_PUBLIC;
+     params.interval = BLE_GATT_ADV_INTERVAL;
+     params.channel_map = BT_LE_ADV_CHANNEL_DEFAULT;
+@@ -468,7 +471,26 @@ int ble_gatt_init(const ble_gatt_config_t* config)
+     /* Get BT instance */
+     g_gatt.bt_ins = bluetooth_get_instance();
+     if (!g_gatt.bt_ins) {
++        static int diag_count = 0;
+         printf("[ble_gatt] FAILED: no BT instance\n");
++        /* Probe: replicate the socket connect to get the real errno.
++         * Only print on the first few attempts to avoid log spam. */
++        if (diag_count++ < 3) {
++            int fd = socket(PF_LOCAL, SOCK_STREAM, 0);
++            if (fd < 0) {
++                printf("[ble_gatt] diag: socket() failed errno=%d (%s)\n",
++                    errno, strerror(errno));
++            } else {
++                struct sockaddr_un u;
++                memset(&u, 0, sizeof(u));
++                u.sun_family = AF_LOCAL;
++                snprintf(u.sun_path, sizeof(u.sun_path), "bt:bluetooth");
++                int rc = connect(fd, (struct sockaddr*)&u, sizeof(u));
++                printf("[ble_gatt] diag: connect() rc=%d errno=%d (%s)\n",
++                    rc, errno, strerror(errno));
++                close(fd);
++            }
++        }
+         goto fail;
+     }
+     printf("[ble_gatt] step 2: register GATT server\n");
+diff --git a/src/infra/cron_service.c b/src/infra/cron_service.c
+index 34509d7..4edd921 100644
+--- a/src/infra/cron_service.c
++++ b/src/infra/cron_service.c
+@@ -363,7 +363,10 @@ static void cron_fire_job(cron_job_t* job, time_t now)
+             }
+         }
+     } else {
+-        /* Plain reminder — push directly to outbound */
++        /* Plain reminder — feed into the agent inbound queue so the
++         * message goes through skill matching + LLM processing
++         * (e.g. the daily briefing skill triggered by "早安简报时间到了").
++         * The reply, if any, is routed back out on the same channel. */
+         agent_msg_t msg;
+         memset(&msg, 0, sizeof(msg));
+         strncpy(msg.channel, job->channel, sizeof(msg.channel) - 1);
+@@ -371,7 +374,7 @@ static void cron_fire_job(cron_job_t* job, time_t now)
+         msg.content = strdup(job->message);
+ 
+         if (msg.content) {
+-            int err = message_bus_push_outbound(&msg);
++            int err = message_bus_push_inbound(&msg);
+             if (err != OK) {
+                 syslog(LOG_WARNING, "[%s] Failed to push cron message\n", TAG);
+                 free(msg.content);
+diff --git a/src/voice/audio_capture.c b/src/voice/audio_capture.c
+index f31e388..a64c0b0 100644
+--- a/src/voice/audio_capture.c
++++ b/src/voice/audio_capture.c
+@@ -30,6 +30,7 @@
+ #endif
+ #include <errno.h>
+ #include <media_recorder.h>
++#include <poll.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -37,6 +38,9 @@
+ #include <syslog.h>
+ #include <unistd.h>
+ 
++/* 采集读之前的 poll 超时（毫秒）。见 audio_capture_read 里的说明。 */
++#define PB_POLL_TIMEOUT_MS 100
++
+ static const char* TAG = "audio_cap";
+ 
+ #define CAP_OPTIONS_LEN 128
+@@ -528,6 +532,36 @@ int audio_capture_read(audio_capture_t* cap, void* buf, size_t len)
+             return -EINVAL;
+         }
+ 
++        /* 必须先 poll 再读。媒体框架的采集走 AF_UNIX socket，直接 recv 会
++         * 永久阻塞：NuttX 的本地 socket 不兑现 SO_RCVTIMEO（选项被存进
++         * s_rcvtimeo 但本地路径从不使用），close()/shutdown() 也唤不醒阻塞中
++         * 的读。结果是停止时 pthread_join() 永不返回——语音对话和 mini_memo
++         * 都卡在这一处。
++         * poll 带超时可绕开这个问题：超时返回 -EAGAIN，而录音循环本来就处理
++         * EAGAIN（voice_channel.c 的 capture read 分支），于是线程能及时看到
++         * 停止请求并退出。100ms 远快于正常出帧节奏，不影响录音质量。 */
++        {
++            int rsock = media_recorder_get_socket(cap->handle.recorder);
++
++            if (rsock > 0) {
++                struct pollfd pfd;
++                int pr;
++
++                pfd.fd = rsock;
++                pfd.events = POLLIN;
++                pfd.revents = 0;
++
++                pr = poll(&pfd, 1, PB_POLL_TIMEOUT_MS);
++                if (pr == 0) {
++                    return -EAGAIN;
++                }
++
++                if (pr < 0) {
++                    return -errno;
++                }
++            }
++        }
++
+         n = media_recorder_read_data(cap->handle.recorder, buf, len);
+         if (n > 0 && cap->bits_per_sample == 16) {
+             apply_capture_gain(buf, (size_t)n);
+diff --git a/src/voice/audio_playback.c b/src/voice/audio_playback.c
+index 6a2089c..3080cfd 100644
+--- a/src/voice/audio_playback.c
++++ b/src/voice/audio_playback.c
+@@ -21,6 +21,7 @@
+ 
+ #include <errno.h>
+ #include <media_player.h>
++#include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -31,15 +32,86 @@ static const char* TAG = "audio_pb";
+ 
+ #define PB_OPTIONS_LEN 128
+ 
++/* 图输出端固定 48kHz 立体声（/etc/media/graph.conf 的 adevsink@pcm0p）。
++ * libavfilter 的 link 是严格格式检查的（avfilter.c ff_filter_frame：格式/
++ * 声道/采样率任一不匹配都直接报错），不会自动重采样或做声道转换。
++ * 而火山 TTS 返回的是 16kHz 单声道，所以必须在写进播放器之前自己转好，
++ * 否则会看到 "Channel layout change is not supported"。 */
++#define PB_OUT_RATE     48000
++#define PB_OUT_CHANNELS 2
++
+ static void* s_active_player;
+ 
+ struct audio_playback {
+     void* player;
+     size_t total_written;
+-    int bytes_per_frame;
++    int bytes_per_frame;            /* 调用方给的数据（输入）格式 */
++    unsigned int in_rate;
++    unsigned int in_channels;
++    int16_t* scratch;               /* 转换缓冲 */
++    size_t scratch_cap;
++    int started;                    /* 播放器实际 start 的时机（首块数据） */
+     volatile int stopped;
+ };
+ 
++/* 线性插值重采样 + 声道扩展。输入取第 0 声道（AI 语音路径是单声道；
++ * 立体声输入也只会用到左声道，够用且无歧义）。 */
++static int pb_convert(audio_playback_t* pb, const void* in, size_t in_len,
++    const void** out, size_t* out_len)
++{
++    const int16_t* src = (const int16_t*)in;
++    size_t in_frames = in_len / (sizeof(int16_t) * pb->in_channels);
++    size_t out_frames;
++    size_t need;
++    size_t f, c;
++
++    if (in_frames == 0) {
++        return -EINVAL;
++    }
++
++    out_frames = (size_t)((uint64_t)in_frames * PB_OUT_RATE / pb->in_rate);
++    need = out_frames * PB_OUT_CHANNELS * sizeof(int16_t);
++
++    if (need > pb->scratch_cap) {
++        int16_t* p = realloc(pb->scratch, need);
++
++        if (!p) {
++            return -ENOMEM;
++        }
++
++        pb->scratch = p;
++        pb->scratch_cap = need;
++    }
++
++    for (f = 0; f < out_frames; f++) {
++        uint64_t pos = (uint64_t)f * pb->in_rate;
++        size_t i0 = (size_t)(pos / PB_OUT_RATE);
++        size_t i1;
++        uint32_t frac = (uint32_t)(pos % PB_OUT_RATE);
++        int32_t s;
++
++        if (i0 >= in_frames) {
++            i0 = in_frames - 1;
++        }
++
++        i1 = (i0 + 1 < in_frames) ? i0 + 1 : i0;
++        s = src[i0 * pb->in_channels];
++
++        if (i1 != i0) {
++            s += (int32_t)(((int32_t)src[i1 * pb->in_channels] - s)
++                * (int64_t)frac / PB_OUT_RATE);
++        }
++
++        for (c = 0; c < PB_OUT_CHANNELS; c++) {
++            pb->scratch[f * PB_OUT_CHANNELS + c] = (int16_t)s;
++        }
++    }
++
++    *out = pb->scratch;
++    *out_len = need;
++    return 0;
++}
++
+ audio_playback_t* audio_playback_open(const char* dev_path,
+     unsigned int sample_rate, unsigned int channels,
+     unsigned int bits_per_sample)
+@@ -60,11 +132,13 @@ audio_playback_t* audio_playback_open(const char* dev_path,
+         return NULL;
+     }
+ 
++    /* 播放器按图输出端的格式开（48k 立体声），调用方给的数据格式在
++     * write 里现转。若调用方本来就是 48k 立体声，则不做转换直接写。 */
+     char opts[PB_OPTIONS_LEN];
+     snprintf(opts, sizeof(opts),
+         "format=s%ule:sample_rate=%u:ch_layout=%s",
+-        bits_per_sample, sample_rate,
+-        (channels == 1) ? "mono" : "stereo");
++        bits_per_sample, PB_OUT_RATE,
++        (PB_OUT_CHANNELS == 1) ? "mono" : "stereo");
+ 
+     int ret = media_player_prepare(player, NULL, opts);
+     if (ret < 0) {
+@@ -73,12 +147,10 @@ audio_playback_t* audio_playback_open(const char* dev_path,
+         return NULL;
+     }
+ 
+-    ret = media_player_start(player);
+-    if (ret < 0) {
+-        syslog(LOG_ERR, "[%s] start failed: %d\n", TAG, ret);
+-        media_player_close(player, 0);
+-        return NULL;
+-    }
++    /* 故意不在这里 start：TTS 是流式的，首块数据通常要等 1s 左右才到。
++     * 提前 start 会让播放器读到空流→判定 EOF→xrun 暂停，之后写进去的数据
++     * 全被拒（实测 closing 时 "0 bytes written"）。改成第一次 write 时再
++     * start，让播放器一起来就有数据可播。 */
+ 
+     audio_playback_t* pb = calloc(1, sizeof(*pb));
+     if (!pb) {
+@@ -88,15 +160,22 @@ audio_playback_t* audio_playback_open(const char* dev_path,
+ 
+     pb->player = player;
+     pb->bytes_per_frame = (bits_per_sample / 8) * channels;
++    pb->in_rate = sample_rate;
++    pb->in_channels = channels;
+     s_active_player = player;
+ 
+-    syslog(LOG_INFO, "[%s] opened (%uHz %uch %ubit)\n",
+-        TAG, sample_rate, channels, bits_per_sample);
++    syslog(LOG_INFO,
++        "[%s] opened (in %uHz %uch -> out %dHz %dch)\n",
++        TAG, sample_rate, channels, PB_OUT_RATE, PB_OUT_CHANNELS);
+     return pb;
+ }
+ 
+ int audio_playback_write(audio_playback_t* pb, const void* buf, size_t len)
+ {
++    const void* out = buf;
++    size_t out_len = len;
++    ssize_t n;
++
+     if (!pb || !pb->player || !buf || len == 0) {
+         return -EINVAL;
+     }
+@@ -105,12 +184,39 @@ int audio_playback_write(audio_playback_t* pb, const void* buf, size_t len)
+         return -ECANCELED;
+     }
+ 
+-    ssize_t n = media_player_write_data(pb->player, buf, len);
+-    if (n > 0) {
+-        pb->total_written += (size_t)n;
++    /* 首块数据到达时才启动播放器（见 open 里的说明）。启动失败按致命处理，
++     * 否则后面每块都会写着玩、日志却看不出问题。 */
++    if (!pb->started) {
++        int sret = media_player_start(pb->player);
++
++        if (sret < 0) {
++            syslog(LOG_ERR, "[%s] lazy start failed: %d\n", TAG, sret);
++            return sret;
++        }
++
++        pb->started = 1;
++        syslog(LOG_INFO, "[%s] player started on first chunk\n", TAG);
++    }
++
++    if (pb->in_rate != PB_OUT_RATE || pb->in_channels != PB_OUT_CHANNELS) {
++        int cret = pb_convert(pb, buf, len, &out, &out_len);
++
++        if (cret < 0) {
++            syslog(LOG_ERR, "[%s] format convert failed: %d\n", TAG, cret);
++            return cret;
++        }
++    }
++
++    n = media_player_write_data(pb->player, out, out_len);
++    if (n < 0) {
++        return (int)n;
+     }
+ 
+-    return (int)n;
++    pb->total_written += (size_t)n;
++
++    /* 返回消费掉的“输入”字节数——转换后输出长度不同，不能让调用方按
++     * 输出长度推进自己的缓冲。 */
++    return (int)len;
+ }
+ 
+ void audio_playback_stop(audio_playback_t* pb)
+@@ -130,13 +236,17 @@ void audio_playback_close(audio_playback_t* pb)
+     }
+ 
+     if (pb->player) {
+-        syslog(LOG_INFO, "[%s] closing (%zu bytes written)\n",
+-            TAG, pb->total_written);
+-        media_player_stop(pb->player);
++        syslog(LOG_INFO, "[%s] closing (%zu bytes written, started=%d)\n",
++            TAG, pb->total_written, pb->started);
++
++        if (pb->started) {
++            media_player_stop(pb->player);
++        }
+         usleep(50 * 1000);
+         media_player_close(pb->player, 0);
+         s_active_player = NULL;
+     }
+ 
++    free(pb->scratch);
+     free(pb);
+ }
+diff --git a/src/voice/voice_channel.c b/src/voice/voice_channel.c
+index 8487250..28ec8d6 100644
+--- a/src/voice/voice_channel.c
++++ b/src/voice/voice_channel.c
+@@ -1052,6 +1052,12 @@ int voice_channel_speak(const char* text)
+     }
+ 
+     /* Try streaming TTS first (callback per chunk) */
++    /* 这里的采样率必须匹配下面 voice_tts_speak_stream() 实际用的后端：
++     * 该函数硬编码走 volc_tts_ws（WebSocket 流式），而它在请求里要的是
++     * AGENT_TTS_WS_SAMPLE_RATE（24k，见 volc_tts_ws.c 构造 audio 段处）。
++     * 注意别和 voice_test_tts 那条路混淆——那条走注册的 V3 HTTP 后端，
++     * 是 16k。写错会让 audio_playback 按错误比例重采样，音调失真。
++     * 单声道->图要求的立体声由 audio_playback 内部转换。 */
+     audio_playback_t* pb = audio_playback_open(
+         AGENT_AUDIO_PLAYBACK_DEV,
+         AGENT_TTS_WS_SAMPLE_RATE,
+diff --git a/src/voice/volc_asr.c b/src/voice/volc_asr.c
+index ee8dc4a..8af1b2a 100644
+--- a/src/voice/volc_asr.c
++++ b/src/voice/volc_asr.c
+@@ -72,6 +72,10 @@ static const char* TAG = "volc_asr";
+ #define WS_MASK_KEY_LEN 4
+ #define WS_OPCODE_BINARY 0x02
+ #define WS_OPCODE_CLOSE 0x08
++/* 控制帧：服务端会发 PING 保活，其载荷长度为 0。以前没处理，PING 会被
++ * 当成畸形火山帧（"Frame too short: 0"）直接失败退出。 */
++#define WS_OPCODE_PING 0x09
++#define WS_OPCODE_PONG 0x0A
+ #define WS_FIN_BIT 0x80
+ #define WS_MASK_BIT 0x80
+ 
+@@ -272,18 +276,24 @@ static void generate_uuid(char* out, size_t cap)
+ /* ── WebSocket upgrade handshake ─────────────────────────────── */
+ 
+ static int ws_upgrade(asr_tls_ctx_t* ctx, const char* host,
+-    const char* path, const char* token)
++    const char* path, const char* app_id, const char* token)
+ {
+     /* Generate random 16-byte key, base64-encode it */
+     unsigned char key_raw[16];
+     unsigned char key_b64[32];
+     size_t key_b64_len;
++    char connect_id[ASR_UUID_LEN];
+ 
+     asr_entropy_func(NULL, key_raw, sizeof(key_raw));
+     mbedtls_base64_encode(key_b64, sizeof(key_b64), &key_b64_len,
+         key_raw, sizeof(key_raw));
+ 
+-    char req[768];
++    /* v3 鉴权：双头 App-Key/Access-Key + 资源号 + 连接 ID。
++     * 老的 "Authorization: Bearer;<token>" 在 v3 上会返回
++     * 400 "app key not found in header or query"。 */
++    generate_uuid(connect_id, sizeof(connect_id));
++
++    char req[1024];
+     int n = snprintf(req, sizeof(req),
+         "GET %s HTTP/1.1\r\n"
+         "Host: %s\r\n"
+@@ -291,10 +301,13 @@ static int ws_upgrade(asr_tls_ctx_t* ctx, const char* host,
+         "Connection: Upgrade\r\n"
+         "Sec-WebSocket-Key: %.*s\r\n"
+         "Sec-WebSocket-Version: 13\r\n"
+-        "Authorization: Bearer;%s\r\n"
++        "X-Api-App-Key: %s\r\n"
++        "X-Api-Access-Key: %s\r\n"
++        "X-Api-Resource-Id: %s\r\n"
++        "X-Api-Connect-Id: %s\r\n"
+         "\r\n",
+         path, host, (int)key_b64_len, key_b64,
+-        token);
++        app_id, token, AGENT_DOUBAO_ASR_RESOURCE, connect_id);
+ 
+     if (n <= 0 || n >= (int)sizeof(req)) {
+         return -EOVERFLOW;
+@@ -406,6 +419,52 @@ static int ws_send_binary(asr_tls_ctx_t* ctx,
+     return 0;
+ }
+ 
++/* 回一个 PONG（控制帧）。服务端发 PING 保活，不回的话对端可能断开连接。 */
++static int ws_send_pong(asr_tls_ctx_t* ctx,
++    const unsigned char* payload, size_t plen)
++{
++    unsigned char hdr[14];
++    size_t hdr_len;
++
++    hdr[0] = WS_FIN_BIT | WS_OPCODE_PONG;
++
++    if (plen < 126) {
++        hdr[1] = WS_MASK_BIT | (unsigned char)plen;
++        hdr_len = 2;
++    } else {
++        hdr[1] = WS_MASK_BIT | 126;
++        hdr[2] = (unsigned char)(plen >> 8);
++        hdr[3] = (unsigned char)(plen & 0xFF);
++        hdr_len = 4;
++    }
++
++    if (plen > 125) {
++        /* 控制帧载荷按 RFC 不允许超过 125，超了就直接放弃回包 */
++        return 0;
++    }
++
++    unsigned char mask[WS_MASK_KEY_LEN];
++
++    asr_entropy_func(NULL, mask, WS_MASK_KEY_LEN);
++    memcpy(hdr + hdr_len, mask, WS_MASK_KEY_LEN);
++    hdr_len += WS_MASK_KEY_LEN;
++
++    int ret = tls_write_all(ctx, hdr, hdr_len);
++
++    if (ret != 0) {
++        return ret;
++    }
++
++    unsigned char chunk[128];
++    size_t i;
++
++    for (i = 0; i < plen; i++) {
++        chunk[i] = payload[i] ^ mask[i % WS_MASK_KEY_LEN];
++    }
++
++    return plen > 0 ? tls_write_all(ctx, chunk, plen) : 0;
++}
++
+ /* ── WebSocket frame recv ────────────────────────────────────── */
+ 
+ static int ws_recv_frame(asr_tls_ctx_t* ctx,
+@@ -524,12 +583,11 @@ static int send_full_client_request(asr_tls_ctx_t* ctx,
+         return -ENOMEM;
+     }
+ 
+-    /* app */
+-    cJSON* app = cJSON_AddObjectToObject(root, "app");
+-
+-    cJSON_AddStringToObject(app, "appid", app_id);
+-    cJSON_AddStringToObject(app, "token", token);
+-    cJSON_AddStringToObject(app, "cluster", cluster);
++    /* v3 请求体：鉴权走握手头，正文不再带 app/token/cluster。
++     * 字段组合经 VM 侧探针实测可用（见 memory: volc-voice-credentials）。 */
++    (void)app_id;
++    (void)token;
++    (void)cluster;
+ 
+     /* user */
+     cJSON* user = cJSON_AddObjectToObject(root, "user");
+@@ -539,27 +597,21 @@ static int send_full_client_request(asr_tls_ctx_t* ctx,
+     /* audio */
+     cJSON* audio = cJSON_AddObjectToObject(root, "audio");
+ 
+-    cJSON_AddStringToObject(audio, "format", "raw");
++    cJSON_AddStringToObject(audio, "format", "pcm");
++    cJSON_AddStringToObject(audio, "codec", "raw");
+     cJSON_AddNumberToObject(audio, "rate",
+         AGENT_VOICE_SAMPLE_RATE);
+     cJSON_AddNumberToObject(audio, "bits", AGENT_VOICE_BITS);
+     cJSON_AddNumberToObject(audio, "channel",
+         AGENT_VOICE_CHANNELS);
+-    cJSON_AddStringToObject(audio, "language", "zh-CN");
+ 
+     /* request */
+     cJSON* req = cJSON_AddObjectToObject(root, "request");
+ 
+-    cJSON_AddStringToObject(req, "reqid", reqid);
+-    cJSON_AddStringToObject(req, "workflow",
+-        "audio_in,resample,partition,vad,fe,decode");
+-    cJSON_AddNumberToObject(req, "sequence", 1);
+-    cJSON_AddNumberToObject(req, "nbest", 1);
+-    cJSON_AddBoolToObject(req, "show_utterances", 0);
+-    /* VAD: avoid cutting short commands on QEMU virtual mic */
+-    cJSON_AddBoolToObject(req, "vad_signal", 1);
+-    cJSON_AddStringToObject(req, "start_silence_time", "3000");
+-    cJSON_AddStringToObject(req, "vad_silence_time", "800");
++    cJSON_AddStringToObject(req, "model_name", "bigmodel");
++    cJSON_AddBoolToObject(req, "enable_itn", 1);
++    cJSON_AddBoolToObject(req, "enable_punc", 1);
++    cJSON_AddStringToObject(req, "result_type", "single");
+ 
+     char* json_str = cJSON_PrintUnformatted(root);
+ 
+@@ -624,11 +676,30 @@ static int recv_volc_response(asr_tls_ctx_t* ctx,
+ 
+     size_t flen;
+     int opcode;
+-    int ret = ws_recv_frame(ctx, buf, WS_BUF_SIZE, &flen, &opcode);
++    int ret;
+ 
+-    if (ret != 0) {
+-        free(buf);
+-        return ret;
++    /* 跳过 WebSocket 控制帧再处理数据帧。服务端会周期性发 PING（载荷长度
++     * 为 0），以前没处理就被当成畸形火山帧："Frame too short: 0" →
++     * recv error -71 → 整个流式识别白跑。收到 PING 要回 PONG。 */
++    for (;;) {
++        ret = ws_recv_frame(ctx, buf, WS_BUF_SIZE, &flen, &opcode);
++
++        if (ret != 0) {
++            free(buf);
++            return ret;
++        }
++
++        if (opcode == WS_OPCODE_PING) {
++            syslog(LOG_INFO, "[%s] WS ping, replying pong\n", TAG);
++            ws_send_pong(ctx, buf, flen);
++            continue;
++        }
++
++        if (opcode == WS_OPCODE_PONG) {
++            continue;
++        }
++
++        break;
+     }
+ 
+     if (opcode == WS_OPCODE_CLOSE) {
+@@ -694,8 +765,18 @@ static int recv_volc_response(asr_tls_ctx_t* ctx,
+         return -EIO;
+     }
+ 
+-    /* ── Normal response: [4B hdr][4B payload_size][payload] ── */
+-    if (flen < volc_hdr_len + 4) {
++    /* ── Normal response ──
++     *   v2: [4B hdr][4B payload_size][payload]
++     *   v3: header 低 4 位(flags)非 0 时，长度字段前多一个 4B 序号：
++     *       [4B hdr][4B sequence][4B payload_size][payload]
++     *   实测 v3 中间结果 flags=1、最终结果 flags=3。 */
++    size_t size_off = volc_hdr_len;
++
++    if ((msg_type_byte & 0x0F) != 0) {
++        size_off += 4;
++    }
++
++    if (flen < size_off + 4) {
+         syslog(LOG_ERR,
+             "[%s] Frame too short for payload size: %zu\n",
+             TAG, flen);
+@@ -703,8 +784,8 @@ static int recv_volc_response(asr_tls_ctx_t* ctx,
+         return -EPROTO;
+     }
+ 
+-    uint32_t payload_len = read_be32(buf, volc_hdr_len);
+-    size_t data_off = volc_hdr_len + 4;
++    uint32_t payload_len = read_be32(buf, size_off);
++    size_t data_off = size_off + 4;
+ 
+     if (data_off + payload_len > flen) {
+         syslog(LOG_ERR,
+@@ -733,68 +814,94 @@ static int recv_volc_response(asr_tls_ctx_t* ctx,
+         return -EPROTO;
+     }
+ 
++    /* v2 才带 code 字段；v3 的错误在握手层用 HTTP 状态码返回，
++     * 响应体里没有 code。缺省视为成功。 */
+     cJSON* code_j = cJSON_GetObjectItem(root, "code");
+-    int code = code_j ? (int)code_j->valuedouble : -1;
+ 
+-    if (code != ASR_RESP_CODE_OK) {
+-        cJSON* msg_j = cJSON_GetObjectItem(root, "message");
++    if (code_j) {
++        int code = (int)code_j->valuedouble;
+ 
+-        syslog(LOG_ERR, "[%s] ASR error %d: %s\n", TAG, code,
+-            (msg_j && msg_j->valuestring)
+-                ? msg_j->valuestring
+-                : "unknown");
+-        cJSON_Delete(root);
+-        return -EIO;
++        if (code != ASR_RESP_CODE_OK) {
++            cJSON* msg_j = cJSON_GetObjectItem(root, "message");
++
++            syslog(LOG_ERR, "[%s] ASR error %d: %s\n", TAG, code,
++                (msg_j && msg_j->valuestring)
++                    ? msg_j->valuestring
++                    : "unknown");
++            cJSON_Delete(root);
++            return -EIO;
++        }
+     }
+ 
+-    /* Extract result[0].text.
+-     * Volcengine streaming ASR sends multiple responses per session.
+-     * We maintain a "confirmed" offset: text_out[0..confirmed_len-1]
+-     * holds final utterances that must not be overwritten.
+-     * Intermediate results (seq >= 0) overwrite only the portion
+-     * after confirmed_len.  Final results (seq < 0) append and
+-     * advance confirmed_len. */
++    /* 提取识别文本。流式 ASR 一次会话会推多帧，语义上分两代：
++     *   v2: result 是数组，取 result[0].text；顶层 sequence<0 表示最终
++     *   v3: result 是对象，取 result.text；result.utterances[0].definite
++     *       为 true（或帧 flags=3）表示最终
++     * 中间结果只覆盖 confirmed_len 之后的部分，最终结果追加并推进
++     * confirmed_len，避免把已确认的文本覆盖掉。 */
+     cJSON* result = cJSON_GetObjectItem(root, "result");
++    const char* text = NULL;
++    int is_final = 0;
+ 
+-    /* Negative sequence means final response */
+-    cJSON* seq_j = cJSON_GetObjectItem(root, "sequence");
+-    int seq = seq_j ? (int)seq_j->valuedouble : 0;
++    if (cJSON_IsArray(result)) {
++        if (cJSON_GetArraySize(result) > 0) {
++            cJSON* txt = cJSON_GetObjectItem(
++                cJSON_GetArrayItem(result, 0), "text");
+ 
+-    if (cJSON_IsArray(result) && cJSON_GetArraySize(result) > 0) {
+-        cJSON* first = cJSON_GetArrayItem(result, 0);
+-        cJSON* txt = cJSON_GetObjectItem(first, "text");
+-
+-        if (txt && cJSON_IsString(txt) && txt->valuestring
+-            && txt->valuestring[0] != '\0') {
+-            static size_t confirmed_len;
+-            if (text_out[0] == '\0') {
+-                confirmed_len = 0;
++            if (cJSON_IsString(txt)) {
++                text = txt->valuestring;
+             }
++        }
++
++        cJSON* seq_j = cJSON_GetObjectItem(root, "sequence");
++
++        is_final = (seq_j && (int)seq_j->valuedouble < 0);
++    } else if (cJSON_IsObject(result)) {
++        cJSON* txt = cJSON_GetObjectItem(result, "text");
++
++        if (cJSON_IsString(txt)) {
++            text = txt->valuestring;
++        }
++
++        cJSON* utts = cJSON_GetObjectItem(result, "utterances");
++
++        if (cJSON_IsArray(utts) && cJSON_GetArraySize(utts) > 0) {
++            cJSON* def = cJSON_GetObjectItem(
++                cJSON_GetArrayItem(utts, 0), "definite");
+ 
+-            if (seq < 0) {
+-                /* Final: write after confirmed, then advance */
+-                size_t remain = text_cap - confirmed_len - 1;
+-                if (remain > 0) {
+-                    strncpy(text_out + confirmed_len,
+-                        txt->valuestring, remain);
+-                    text_out[text_cap - 1] = '\0';
+-                }
+-                confirmed_len = strlen(text_out);
+-            } else {
+-                /* Intermediate: overwrite only after confirmed */
+-                size_t remain = text_cap - confirmed_len - 1;
+-                if (remain > 0) {
+-                    strncpy(text_out + confirmed_len,
+-                        txt->valuestring, remain);
+-                    text_out[text_cap - 1] = '\0';
+-                }
++            if (def && (def->type == cJSON_True)) {
++                is_final = 1;
+             }
+         }
++
++        /* 帧 flags=3 也是末帧的标记 */
++        if ((msg_type_byte & 0x0F) == 3) {
++            is_final = 1;
++        }
++    }
++
++    if (text && text[0] != '\0') {
++        static size_t confirmed_len;
++
++        if (text_out[0] == '\0') {
++            confirmed_len = 0;
++        }
++
++        size_t remain = text_cap - confirmed_len - 1;
++
++        if (remain > 0) {
++            strncpy(text_out + confirmed_len, text, remain);
++            text_out[text_cap - 1] = '\0';
++        }
++
++        if (is_final) {
++            confirmed_len = strlen(text_out);
++        }
+     }
+ 
+     cJSON_Delete(root);
+ 
+-    return (seq < 0) ? 1 : 0;
++    return is_final ? 1 : 0;
+ }
+ 
+ /* ── Credentials (self-loaded from config store) ─────────────── */
+@@ -858,7 +965,7 @@ int volc_asr_recognize(const unsigned char* pcm_data,
+ 
+     /* 2. WebSocket upgrade */
+     ret = ws_upgrade(&ctx, AGENT_DOUBAO_ASR_HOST,
+-        AGENT_DOUBAO_ASR_WS_PATH, token);
++        AGENT_DOUBAO_ASR_WS_PATH, app_id, token);
+     if (ret != 0) {
+         asr_tls_free(&ctx);
+         return ret;
+@@ -970,7 +1077,7 @@ volc_asr_stream_t* volc_asr_stream_open(void)
+     }
+ 
+     ret = ws_upgrade(&s->tls, AGENT_DOUBAO_ASR_HOST,
+-        AGENT_DOUBAO_ASR_WS_PATH, s_token);
++        AGENT_DOUBAO_ASR_WS_PATH, s_app_id, s_token);
+     if (ret != 0) {
+         asr_tls_free(&s->tls);
+         free(s);
+diff --git a/src/voice/volc_tts_ws.c b/src/voice/volc_tts_ws.c
+index 4165929..e575fb9 100644
+--- a/src/voice/volc_tts_ws.c
++++ b/src/voice/volc_tts_ws.c
+@@ -62,7 +62,10 @@ static const char* TAG = "volc_tts_ws";
+ #define VOLC_SER_RAW 0x00
+ 
+ /* WebSocket constants */
+-#define WS_BUF_SIZE (32 * 1024)
++/* 服务端单帧音频实测可达 ~43KB（"WS frame too large: 43470"），32KB 会让
++ * 流在对帧处中断、只拿到前几块音频。放大到 256KB。板子空余堆 ~900MB，
++ * 这点开销可忽略。 */
++#define WS_BUF_SIZE (256 * 1024)
+ #define WS_MASK_KEY_LEN 4
+ #define WS_OPCODE_BINARY 0x02
+ #define WS_OPCODE_CLOSE 0x08

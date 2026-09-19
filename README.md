@@ -33,8 +33,13 @@ docs/                  固件修复补丁与摘要
   ├─ ai-agent-cron-inbound.patch            v12：cron 定时任务自动触发 AI 简报（核心功能）
   ├─ ai-agent-ble-gatt-fixes-*.patch        蓝牙 BLE 广播/栈溢出修复
   ├─ firmware-fixes-board-defconfig-*.patch 板级 defconfig 修复（mediad alsasink 白屏根因）
+  ├─ ai-agent-voice-volc-20260919.patch     语音链路：火山 TTS/ASR 接入、录音/播放修复、配置路径
+  ├─ firmware-fixes-avfilter-assert-20260919.patch  ★ ffmpeg 滤镜 assert 崩溃修复（mediad 稳定性根因）
+  ├─ firmware-fixes-media-framework-20260919.patch  media 框架修复（录音 poll / 播放器 EOF / 图管理）
+  ├─ firmware-fixes-media-20260919.patch    mediad 判据重名、音频图、板级裁剪
   ├─ fixes-summary-*.md                     各阶段修复摘要（根因 + 验证证据）
-  └─ status-2026-09-08.md                   当前进度快照（功能/验证/待办）
+  ├─ fixes-summary-20260919.md              ★ 语音链路打通 + mediad 崩溃根因（含 assert 因果链）
+  └─ status-2026-09-19.md                   当前进度快照（功能/验证/待办）
 skills/                部署到板端 AI Agent 的技能与记忆种子文件
   ├─ ai-dev-workflow/SKILL.md               自建 Skill：AI 辅助板端开发的完整流程沉淀
   ├─ memory-seed.md / morning-health-briefing.md   板端技能/记忆内容（.md 见仓内说明）
@@ -109,7 +114,18 @@ git apply ../contest2026_218_mutumuzi/docs/firmware-fixes-board-defconfig-202608
 | BLE 广播/栈修复 | ✅ 完成 | docs/ai-agent-ble-gatt-fixes-* |
 | chunked 读取修复 | ✅ 完成（公共仓 PR #27 待合） | docs/ai-agent-chunked-fix.patch |
 | 简报上屏（LVGL 卡片） | ✅ 完成，v13 全链路实测（ask → LLM → mqueue → 卡片刷新 + 非简报不上屏回归） | logs/2026-09-10；docs/ai-agent-screen-briefing-mq.patch |
-| TTS 语音播报 | ⚠️ 部分：音频软件链路已修复并验证（mediad→alsasink→codec 全流程日志级通过）；云端 TTS 引擎未接入（需火山方舟账号密钥）；实机扬声器需外接（HS 板载仅麦克风，HPOUT 为 3.5mm 耳机孔） | logs/2026-09-08~09 |
+| **mediad 会话崩溃修复**（播放停止即崩） | ✅ 完成，v32 起 5 轮压测进程存活 | 根因：link 已带 status 仍调 `ff_inlink_request_frame` → assert 打死进程；见 docs/fixes-summary-20260919.md 第一节 |
+| **TTS 语音合成**（火山 V3） | ✅ 完成，真机实测 | `[volc_tts] TTS: synthesized 86016 PCM bytes (7 chunks)`；资源 `seed-tts-2.0` + `zh_male_m191_uranus_bigtts` |
+| **语音播报出声** | ✅ 完成，**耳机实听确认** | `PREPARED(1) ret:0 → STARTED(2) ret:0 → COMPLETED(6) ret:0`；`audio_playback.c` 按 48k 立体声开播放器 + `pb_convert()` 重采样 |
+| **录音链路** | ✅ 完成 | `recording thread exit: 1034 chunks, 220784 read`；停录收尾 `close → recorder thread exit` |
+| **ASR 语音识别**（火山 v3） | ⚠️ 代码完成并迁移至 v3，真机端到端待真人说话验证 | `volc_asr.c` 支持 v3 双请求头 + 二进制帧 + PING/PONG |
+| 完整语音对话闭环（说话→回话） | ⚠️ 组件齐备（ASR/LLM/TTS/播放均已打通），端到端串联待验证 | LLM 可路由切换（MiMo / DeepSeek） |
+| LLM 对话 | ⚠️ 可路由；配额受限时存在 60s 看门狗超时 | 支持 MiMo / DeepSeek / OpenAI 兼容后端 |
+| 语音按钮 UI（PTT） | ⚠️ 代码完成未启用：`ui/lvgl_ui_channel.c` 含完整 PTT 实现（112px 圆形"请说"按钮 → ASR），受 `CONFIG_AI_AGENT_LVGL_UI` 控制；本次固件未开启（该开关从未编译过，启用后构建失败） | 设计按圆形表盘，方屏适配待调 |
 | 屏幕常驻 UI（时间/温湿度/距离卡片） | ✅ 板载 luncher 原生功能，正常 | 实拍见提交材料 |
 
-> 诚实说明：本作品**未使用**示例骨架 app/board/quickapp；天气检索质量（Tavily 页面解析）处于"可用但待打磨"状态；TTS 云端引擎未接入（无密钥）且硬件需外接扬声器——均已如实标注。代码行数不是亮点，真机全链路与系统性排障才是。演示视频拍摄中（周末补充）。
+> 诚实说明：本作品**未使用**示例骨架 app/board/quickapp；天气检索质量（Tavily 页面解析）处于"可用但待打磨"状态。
+> **语音部分**：TTS 合成与播报出声已在真机验证（耳机实听），录音链路已打通；ASR 与完整对话闭环代码就绪、端到端待真人验证；
+> 语音按钮 UI 代码完整但本次固件未启用（详见上表）。硬件上 HS 板载仅麦克风，音频输出走 3.5mm 耳机孔。
+> 另：第 32 版固件修复的 mediad 崩溃是**播放稳定性**的关键修复，根因与证据见 `docs/fixes-summary-20260919.md`。
+> 代码行数不是亮点，真机全链路与系统性排障才是。
