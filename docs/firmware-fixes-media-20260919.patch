@@ -1,0 +1,596 @@
+diff --git a/apps/luncher_mini/luncher_mini.c b/apps/luncher_mini/luncher_mini.c
+index a9bdec9d..20865bb5 100644
+--- a/apps/luncher_mini/luncher_mini.c
++++ b/apps/luncher_mini/luncher_mini.c
+@@ -43,7 +43,8 @@
+ #include <sensor/humi.h>
+ #include <sensor/prox.h>
+ #include <uORB/uORB.h>
+-#include <syslog.h> 
++#include <syslog.h>
++#include <mqueue.h>
+ 
+ /* 条件包含 libuv 头文件 */
+ #ifdef CONFIG_LV_USE_NUTTX_LIBUV
+@@ -152,6 +153,19 @@ static bool light_initialized = false;
+ /* Gamble信息UI变量 */
+ static lv_obj_t *gamble_window = NULL;
+ 
++/* ── AI 简报卡片（ai_agent -> luncher_mini，跨进程 mqueue）──
++ * 队列名不带前导 '/'（板级 CONFIG_FS_MQUEUE_NAME_INITIAL_SLASH 未开，
++ * 实际路径 /var/mqueue/briefing）。常量必须与 ai_agent agent_loop.c
++ * 的 SCREEN_MQ_* 完全一致。 */
++#define BRIEFING_MQ_NAME    "briefing"
++#define BRIEFING_MQ_MAXMSG  4
++#define BRIEFING_MQ_MSGSIZE 1024
++#define BRIEFING_BODY_MAX   200   /* 卡片显示字节上限（UTF-8 安全，约 60 汉字） */
++static mqd_t briefing_mq = (mqd_t)-1;
++static lv_obj_t *briefing_body_label = NULL;
++static char briefing_mq_buf[BRIEFING_MQ_MSGSIZE + 1]; /* >= msgsize 防 EMSGSIZE */
++static char briefing_display[BRIEFING_BODY_MAX + 1];
++
+ /* 中文支持字体变量 */
+ static lv_font_t *g_misans_normal_11;
+ static lv_font_t *g_misans_normal_12;
+@@ -752,6 +766,118 @@ static void restore_color_cb(lv_timer_t *timer)
+     lv_timer_del(timer);
+ }
+ 
++/****************************************************************************
++ * AI 简报卡片（主界面右上角常显，显示最新简报摘要）
++ ****************************************************************************/
++static void create_briefing_card(lv_obj_t *parent)
++{
++    /* 卡片几何：右上空白象限（x165..315 × y15..135），不遮挡左半
++     * datetime_area(≤160) 与 y140 起的四窗卡片 */
++    lv_obj_t *card = lv_obj_create(parent);
++    lv_obj_set_size(card, 150, 120);
++    lv_obj_align(card, LV_ALIGN_TOP_RIGHT, -5, 15);
++    lv_obj_set_style_bg_color(card, lv_color_hex(0x2C3E50), 0);
++    lv_obj_set_style_bg_opa(card, LV_OPA_70, 0);
++    lv_obj_set_style_radius(card, 8, 0);
++    lv_obj_set_style_border_width(card, 0, 0);
++
++    /* 标题 */
++    lv_obj_t *title = lv_label_create(card);
++    lv_label_set_text(title, "AI 简报");
++    lv_obj_set_style_text_font(title, g_misans_normal_12, 0);
++    lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
++    lv_obj_set_pos(title, 8, 6);
++
++    /* 正文：固定高裁剪容器（仿 gamble 弹窗模式），超长只纵向滚动不越界 */
++    lv_obj_t *body = lv_obj_create(card);
++    lv_obj_set_pos(body, 8, 26);
++    lv_obj_set_size(body, 134, 86);
++    lv_obj_set_style_bg_opa(body, LV_OPA_TRANSP, 0);
++    lv_obj_set_style_border_width(body, 0, 0);
++    lv_obj_set_style_pad_all(body, 0, 0);
++    lv_obj_set_scroll_dir(body, LV_DIR_VER);
++    lv_obj_set_scrollbar_mode(body, LV_SCROLLBAR_MODE_OFF);
++
++    briefing_body_label = lv_label_create(body);
++    lv_obj_set_style_text_font(briefing_body_label, g_misans_normal_11, 0);
++    lv_obj_set_style_text_color(briefing_body_label, lv_color_hex(0xECF0F1), 0);
++    lv_label_set_long_mode(briefing_body_label, LV_LABEL_LONG_WRAP);
++    lv_obj_set_width(briefing_body_label, 134);
++    lv_label_set_text(briefing_body_label, "暂无简报");
++}
++
++/* 清洗：丢弃 4 字节 emoji（MiSans 无字形）+ UTF-8 安全截断 */
++static void briefing_sanitize(const char *src)
++{
++    size_t o = 0;
++    const unsigned char *p = (const unsigned char *)src;
++
++    while (*p && o + 3 < BRIEFING_BODY_MAX) {
++        if (*p >= 0xF0) {
++            p += 4;   /* emoji/非 BMP：整字符跳过 */
++            continue;
++        }
++        if (*p < 0x80) {          /* ASCII 1 字节 */
++            briefing_display[o++] = (char)*p++;
++        } else if (*p < 0xE0) {   /* 2 字节 */
++            briefing_display[o++] = (char)*p++;
++            if (*p) briefing_display[o++] = (char)*p++;
++        } else {                  /* 3 字节 CJK */
++            briefing_display[o++] = (char)*p++;
++            if (*p) briefing_display[o++] = (char)*p++;
++            if (*p) briefing_display[o++] = (char)*p++;
++        }
++    }
++    briefing_display[o] = '\0';
++}
++
++/* 惰性打开 + O_CREAT：ai_agent 没起也能建队列，谁先起都行 */
++static int briefing_mq_open_once(void)
++{
++    if (briefing_mq >= 0) {
++        return 0;
++    }
++
++    struct mq_attr attr = {
++        .mq_maxmsg = BRIEFING_MQ_MAXMSG,
++        .mq_msgsize = BRIEFING_MQ_MSGSIZE,
++    };
++    briefing_mq = mq_open(BRIEFING_MQ_NAME,
++                          O_RDONLY | O_CREAT | O_NONBLOCK, 0666, &attr);
++    if (briefing_mq == (mqd_t)-1) {
++        LV_LOG_WARN("Briefing mq_open failed: %d", errno);
++        return -1;   /* 下个 tick 重试 */
++    }
++    LV_LOG_INFO("Briefing mqueue open ok");
++    return 0;
++}
++
++/* 1s lv_timer：排空队列，取最后一条刷新 label */
++static void briefing_poll_cb(lv_timer_t *timer)
++{
++    LV_UNUSED(timer);
++    if (briefing_mq_open_once() != 0) {
++        return;
++    }
++
++    bool got = false;
++    int i;
++    for (i = 0; i < BRIEFING_MQ_MAXMSG; i++) {
++        ssize_t n = mq_receive(briefing_mq, briefing_mq_buf,
++                               BRIEFING_MQ_MSGSIZE, NULL);
++        if (n < 0) {
++            break;   /* EAGAIN=空队列；其它错误也退出 */
++        }
++        briefing_mq_buf[n] = '\0';
++        got = true;
++    }
++    if (got) {
++        briefing_sanitize(briefing_mq_buf);
++        lv_label_set_text(briefing_body_label, briefing_display);
++        LV_LOG_INFO("Briefing card updated: %.60s", briefing_display);
++    }
++}
++
+ /****************************************************************************
+  * 创建主界面
+  ****************************************************************************/
+@@ -856,6 +982,9 @@ static void create_main_screen(void)
+         /* 添加点击事件 */
+         lv_obj_add_event_cb(window[i], window_click_cb, LV_EVENT_CLICKED, NULL);
+     }
++
++    /* AI 简报卡片（右上角常显） */
++    create_briefing_card(main_area);
+ }
+ 
+ /****************************************************************************
+@@ -1252,6 +1381,15 @@ int luncher_mini_main(int argc, FAR char *argv[])
+         lv_timer_set_repeat_count(time_timer, -1);
+         LV_LOG_INFO("Time update timer created successfully");
+     }
++    /* AI 简报轮询定时器（每秒非阻塞收 mqueue，最新一条上屏） */
++    lv_timer_t *brf_timer = lv_timer_create(briefing_poll_cb, 1000, NULL);
++    if (brf_timer == NULL) {
++        LV_LOG_ERROR("Failed to create briefing update timer");
++    } else {
++        lv_timer_set_repeat_count(brf_timer, -1);
++        LV_LOG_INFO("Briefing update timer created successfully");
++        briefing_mq_open_once();   /* 提前建队列/提前失败打日志 */
++    }
+     /* 显示分辨率信息 */
+     lv_disp_t *disp = lv_disp_get_default();
+     lv_coord_t disp_width = lv_disp_get_hor_res(disp);
+diff --git a/boards/r528/r528s3-gemini-s1/configs/nsh_minidisplay/defconfig b/boards/r528/r528s3-gemini-s1/configs/nsh_minidisplay/defconfig
+index 2a614a80..52c41b9c 100644
+--- a/boards/r528/r528s3-gemini-s1/configs/nsh_minidisplay/defconfig
++++ b/boards/r528/r528s3-gemini-s1/configs/nsh_minidisplay/defconfig
+@@ -8,7 +8,6 @@
+ # CONFIG_BINFMT_DISABLE is not set
+ # CONFIG_BT_GATT_CACHING is not set
+ # CONFIG_BT_HCI_ACL_FLOW_CONTROL is not set
+-# CONFIG_DEBUG_ERROR is not set
+ # CONFIG_DISABLE_ENVIRON is not set
+ # CONFIG_DISABLE_MQUEUE is not set
+ # CONFIG_DISABLE_POSIX_TIMERS is not set
+@@ -30,7 +29,6 @@
+ # CONFIG_FS_PROCFS_EXCLUDE_USAGE is not set
+ # CONFIG_FS_PROCFS_EXCLUDE_VERSION is not set
+ # CONFIG_LV_USE_GENERIC_MIPI is not set
+-# CONFIG_MBEDTLS_NET_C is not set
+ # CONFIG_MMCSD_HAVE_CARDDETECT is not set
+ # CONFIG_NSH_DISABLEBG is not set
+ # CONFIG_NSH_DISABLESCRIPT is not set
+@@ -97,7 +95,6 @@
+ # CONFIG_NSH_DISABLE_WGET is not set
+ # CONFIG_NSH_DISABLE_XD is not set
+ # CONFIG_ONESHOT_AS_TICK is not set
+-# CONFIG_QUICKAPP_AIOTJSC is not set
+ # CONFIG_STANDARD_SERIAL is not set
+ # CONFIG_STDIO_LINEBUFFER is not set
+ CONFIG_ADBD_FILE_SERVICE=y
+@@ -109,6 +106,7 @@ CONFIG_ADBD_STACKSIZE=8192
+ CONFIG_ADBD_USB_BOARDCTL=y
+ CONFIG_ADBD_USB_SERVER=y
+ CONFIG_ADC=y
++CONFIG_AI_AGENT_BLE_GATT=y
+ CONFIG_ALLOW_BSD_COMPONENTS=y
+ CONFIG_ALLOW_GPL_COMPONENTS=y
+ CONFIG_ALLOW_MIT_COMPONENTS=y
+@@ -138,7 +136,9 @@ CONFIG_ARMV7A_STRCMP=y
+ CONFIG_ARMV7A_STRLEN=y
+ CONFIG_ARM_THUMB=y
+ CONFIG_AUDIO=y
++CONFIG_AUDIOUTILS_ALSA_LIB=y
+ CONFIG_AUDIOUTILS_NXAUDIO_LIB=y
++CONFIG_AUDIOUTILS_SPEEXDSP=y
+ CONFIG_AUDIO_CUSTOM_DEV_PATH=y
+ CONFIG_AUDIO_DRIVER_SPECIFIC_BUFFERS=y
+ CONFIG_AUDIO_EXCLUDE_VOLUME=y
+@@ -151,8 +151,10 @@ CONFIG_BLUETOOTH_BLE_ADV=y
+ CONFIG_BLUETOOTH_BLE_SCAN=y
+ CONFIG_BLUETOOTH_BLE_SUPPORT=y
+ CONFIG_BLUETOOTH_FRAMEWORK_SOCKET_IPC=y
++CONFIG_BLUETOOTH_HCI_RECV_STACKSIZE=16384
+ CONFIG_BLUETOOTH_IPC_JOIN_LOOP=y
+ CONFIG_BLUETOOTH_LE_ADVERTISER_MAX_NUM=4
++CONFIG_BLUETOOTH_SERVER=y
+ CONFIG_BLUETOOTH_SERVICE=y
+ CONFIG_BLUETOOTH_SLIP=y
+ CONFIG_BLUETOOTH_SLIP_TXBUFSIZE=4160
+@@ -192,9 +194,10 @@ CONFIG_BT_GATT_AUTO_UPDATE_MTU=y
+ CONFIG_BT_GATT_CLIENT=y
+ CONFIG_BT_GATT_DYNAMIC_DB=y
+ CONFIG_BT_H4=y
+-CONFIG_BT_HCI_TX_STACK_SIZE=4096
++CONFIG_BT_HCI_TX_STACK_SIZE=16384
+ CONFIG_BT_HCI_TX_STACK_SIZE_WITH_PROMPT=y
+ CONFIG_BT_L2CAP_TX_MTU=498
++CONFIG_BT_LIGHTCTRL=y
+ CONFIG_BT_LIGHTCTRL_STACKSIZE=28672
+ CONFIG_BT_MAX_CONN=5
+ CONFIG_BT_MAX_PAIRED=10
+@@ -202,6 +205,7 @@ CONFIG_BT_POWER_MODE_CONTROL=y
+ CONFIG_BT_PRIVACY=y
+ CONFIG_BT_RX_STACK_SIZE=4096
+ CONFIG_BT_SAMPLE=y
++CONFIG_BT_START=y
+ CONFIG_BT_START_STACKSIZE=28672
+ CONFIG_BUILTIN=y
+ CONFIG_COMPONENTS_AW_ALSA_UTILS=y
+@@ -212,15 +216,14 @@ CONFIG_COMPONENTS_BLUETOOTH=y
+ CONFIG_CRYPTO=y
+ CONFIG_CRYPTO_CRYPTODEV=y
+ CONFIG_CRYPTO_CRYPTODEV_HARDWARE=y
+-CONFIG_CXX_EXCEPTION=y
+-CONFIG_CXX_LOCALIZATION=y
+-CONFIG_CXX_RTTI=y
+ CONFIG_DEBUG_FEATURES=y
+ CONFIG_DEBUG_FULLOPT=y
+ CONFIG_DEBUG_SYMBOLS=y
+ CONFIG_DEBUG_UORB=y
++CONFIG_DEBUG_WIRELESS=y
++CONFIG_DEBUG_WIRELESS_ERROR=y
++CONFIG_DEBUG_WIRELESS_WARN=y
+ CONFIG_DEFAULT_SMALL=y
+-CONFIG_DEFAULT_TASK_STACKSIZE=16384
+ CONFIG_DETECT_CARD=y
+ CONFIG_DEV_GPIO=y
+ CONFIG_DEV_NULL=y
+@@ -262,8 +265,10 @@ CONFIG_DRVR_READAHEAD=y
+ CONFIG_DRVR_WRITEBUFFER=y
+ CONFIG_ELF=y
+ CONFIG_ETC_ROMFS=y
++CONFIG_EVENT_FD=y
+ CONFIG_EXAMPLES_ADC=y
+ CONFIG_EXAMPLES_ADC_DEVPATH="/dev/input/event1"
++CONFIG_EXAMPLES_AI_AGENT_VELA=y
+ CONFIG_EXAMPLES_FB=y
+ CONFIG_EXAMPLES_FB_STACKSIZE=8192
+ CONFIG_EXAMPLES_GPIO=y
+@@ -274,13 +279,13 @@ CONFIG_EXAMPLES_LVGLDEMO_STACKSIZE=40960
+ CONFIG_FAT_DIRECT_RETRY=y
+ CONFIG_FAT_LCNAMES=y
+ CONFIG_FB_SYNC=y
+-CONFIG_FEATURE_FRAMEWORK=y
+ CONFIG_FILE_STREAM=y
+ CONFIG_FS_BINFS=y
+ CONFIG_FS_FAT=y
+ CONFIG_FS_FATFS=y
+ CONFIG_FS_FATFS_SECTOR_RATIO=256
+ CONFIG_FS_LARGEFILE=y
++CONFIG_FS_LITTLEFS=y
+ CONFIG_FS_LOCK_BUCKET_SIZE=8
+ CONFIG_FS_PROCFS=y
+ CONFIG_FS_PROCFS_REGISTER=y
+@@ -294,17 +299,15 @@ CONFIG_GRAPHICS_LVGL=y
+ CONFIG_GT911_IIC_TOUCH=y
+ CONFIG_HAL_TEST_DISP=y
+ CONFIG_HAL_TEST_GPADC=y
+-CONFIG_HAVE_CXX=y
+ CONFIG_I2C=y
+ CONFIG_IDLETHREAD_STACKSIZE=20480
+ CONFIG_IEEE80211_REALTEK_WIFI=y
+ CONFIG_IEEE80211_REALTEK_WIFI_RTL8733BS=y
+ CONFIG_IMAGE_PACK_PATH="../vendor/allwinnertech/lichee/board/r528s3/gemini-s1_nand/configs/nsh.fex"
+ CONFIG_INIT_ENTRYPOINT="nsh_main"
+-CONFIG_INIT_STACKSIZE=32768
++CONFIG_INIT_STACKSIZE=16384
+ CONFIG_INPUT=y
+ CONFIG_INPUT_BUTTONS=y
+-CONFIG_INTERPRETERS_QUICKJS=y
+ CONFIG_IOB_BUFSIZE=1600
+ CONFIG_IOB_NBUFFERS=3072
+ CONFIG_IOB_THROTTLE=256
+@@ -314,32 +317,30 @@ CONFIG_KVDB=y
+ CONFIG_KVDB_SERVER=y
+ CONFIG_LCD=y
+ CONFIG_LCD_DEV=y
+-CONFIG_LCD_EXTERNINIT=y
+-CONFIG_LCD_FRAMEBUFFER=y
+ CONFIG_LCD_ILI9341=y
+ CONFIG_LCD_ILI9341_IFACE0=y
+ CONFIG_LCD_SUPPORT_ILI9341=y
+ CONFIG_LED_RGB_TEST=y
+ CONFIG_LED_RGB_WS2812=y
+-CONFIG_LIBASH=y
+-CONFIG_LIBCXX=y
+ CONFIG_LIBC_LOCALE=y
+ CONFIG_LIBC_LONG_LONG=y
+-CONFIG_LIBM_NEWLIB=y
++CONFIG_LIBM_LIBMCS=y
+ CONFIG_LIBUV=y
+ CONFIG_LIBUV_EXTENSION=y
+ CONFIG_LIBUV_THREAD_STACKSIZE=12288
+ CONFIG_LIB_CARES=y
+ CONFIG_LIB_CURL_CA_PATH="/etc/ssl/certs"
+ CONFIG_LIB_CURL_PTHREAD_STACKSIZE=61440
++CONFIG_LIB_FFMPEG=y
++CONFIG_LIB_FFMPEG_CONFIGURATION="--enable-avcodec --enable-avformat --enable-swresample --enable-avfilter --enable-avdevice --enable-decoder=pcm_s16le --enable-encoder=pcm_s16le --enable-demuxer=wav,pcm_s16le --enable-muxer=wav,pcm_s16le --enable-indev=nuttx --enable-outdev=nuttx --enable-protocol=file,unix --enable-filter=adevsrc,adevsink,abufsrc,abufsink,alsasrc,alsasink,aresample,volume,amovie,amoviesink --enable-small"
+ CONFIG_LIB_FREETYPE=y
++CONFIG_LIB_PFW=y
+ CONFIG_LIB_PNG=y
+ CONFIG_LIB_SSH=y
+-CONFIG_LIB_YOGA=y
+ CONFIG_LIB_ZLIB=y
+ CONFIG_LINE_MAX=256
+-CONFIG_LTO_FULL=y
+ CONFIG_LUNCHER_MINI_APP=y
++CONFIG_LVX_USE_DEMO_MINI_MEMO=y
+ CONFIG_LV_BIN_DECODER_RAM_LOAD=y
+ CONFIG_LV_CACHE_DEF_SIZE=1048576
+ CONFIG_LV_CALENDAR_WEEK_STARTS_MONDAY=y
+@@ -377,13 +378,15 @@ CONFIG_LV_USE_LIBPNG=y
+ CONFIG_LV_USE_LOG=y
+ CONFIG_LV_USE_NUTTX=y
+ CONFIG_LV_USE_NUTTX_LCD=y
+-CONFIG_LV_USE_NUTTX_LIBUV=y
+ CONFIG_LV_USE_NUTTX_TOUCHSCREEN=y
+ CONFIG_LV_USE_QRCODE=y
+-CONFIG_LV_USE_VECTOR_GRAPHIC=y
+ CONFIG_MBEDTLS_THREADING_C=y
+ CONFIG_MBEDTLS_THREADING_PTHREAD=y
+ CONFIG_MEDIA=y
++CONFIG_MEDIA_FOCUS=y
++CONFIG_MEDIA_SERVER=y
++CONFIG_MEDIA_SERVER_PORT=4040
++CONFIG_MEDIA_TOOL=y
+ CONFIG_MICRO_TF=y
+ CONFIG_MMCSD=y
+ CONFIG_MMCSD_SDIO=y
+@@ -414,10 +417,10 @@ CONFIG_NETINIT_WAPI_AUTHWPA_WPA_WPA2=y
+ CONFIG_NETINIT_WAPI_CIPHERMODE_TKIP=y
+ CONFIG_NETLINK_ALLOC_CONNS=1
+ CONFIG_NETLINK_ROUTE=y
+-CONFIG_NETUTILS_CJSON=y
+ CONFIG_NETUTILS_DHCPC_RECV_TIMEOUT_MS=200
+ CONFIG_NETUTILS_DHCPC_RETRIES=20
+ CONFIG_NETUTILS_NTPCLIENT_STACKSIZE=3072
++CONFIG_NETUTILS_WEBCLIENT=y
+ CONFIG_NET_ALLOC_DEVIF_CALLBACKS=1
+ CONFIG_NET_ARPTAB_SIZE=48
+ CONFIG_NET_ARP_IPIN=y
+@@ -473,16 +476,10 @@ CONFIG_NSH_PROMPT_MAX=256
+ CONFIG_NSH_QUOTE=y
+ CONFIG_NXPLAYER_MAINTHREAD_STACKSIZE=3072
+ CONFIG_NXRECORDER_MAINTHREAD_STACKSIZE=3072
+-CONFIG_PROTOBUF_C=y
+-CONFIG_PTHREAD_MUTEX_BOTH=y
+-CONFIG_PTHREAD_MUTEX_DEFAULT_NORMAL=y
+-CONFIG_PTHREAD_MUTEX_DEFAULT_ROBUST=y
+-CONFIG_PTHREAD_STACK_DEFAULT=16384
++CONFIG_OPENSSL_MBEDTLS_WRAPPER=y
++CONFIG_PTHREAD_MUTEX_TYPES=y
++CONFIG_PTHREAD_STACK_DEFAULT=4096
+ CONFIG_PWM=y
+-CONFIG_QUICKAPP=y
+-CONFIG_QUICKAPP_PRIORITY=100
+-CONFIG_QUICKAPP_STACKSIZE=131072
+-CONFIG_QUICKAPP_VAPP=y
+ CONFIG_R528_AUDIO=y
+ CONFIG_R528_DDR_MAPSIZE=8388608
+ CONFIG_R528_IRQ_WD=y
+@@ -529,6 +526,7 @@ CONFIG_SPI_TRIGGER=y
+ CONFIG_STACK_CANARIES=y
+ CONFIG_STACK_COLORATION=y
+ CONFIG_STACK_USAGE=y
++CONFIG_STACK_USAGE_WARNING=4096
+ CONFIG_SUNXI_DISP2_FB_HW_ROTATION_SUPPORT=y
+ CONFIG_SYMTAB_ORDEREDBYNAME=y
+ CONFIG_SYSLOG_BUFFER=y
+@@ -560,6 +558,7 @@ CONFIG_SYSTEM_NXPLAYER=y
+ CONFIG_SYSTEM_NXRECORDER=y
+ CONFIG_SYSTEM_PING=y
+ CONFIG_SYSTEM_PING_STACKSIZE=3072
++CONFIG_SYSTEM_POPEN=y
+ CONFIG_SYSTEM_SETLOGMASK=y
+ CONFIG_SYSTEM_SYSTEM=y
+ CONFIG_SYSTEM_TCPDUMP=y
+@@ -570,7 +569,6 @@ CONFIG_TESTING_CMOCKA=y
+ CONFIG_TESTING_DRIVER_TEST=y
+ CONFIG_TIMER=y
+ CONFIG_TIMER_FD=y
+-CONFIG_TLS_NELEM=16
+ CONFIG_TLS_TASK_NELEM=4
+ CONFIG_TTY_FORCE_PANIC=y
+ CONFIG_TTY_SIGINT=y
+@@ -583,7 +581,6 @@ CONFIG_UART_BTH4=y
+ CONFIG_UART_BTH5=y
+ CONFIG_UART_BTH5_RXBUFSIZE=2048
+ CONFIG_UART_BTH5_TXBUFSIZE=1024
+-CONFIG_UIKIT=y
+ CONFIG_UNQLITE=y
+ CONFIG_UORB=y
+ CONFIG_UORB_LISTENER=y
+@@ -603,7 +600,6 @@ CONFIG_USE_SD=y
+ CONFIG_USE_SDIO=y
+ CONFIG_USE_SDMMC_MULT=y
+ CONFIG_UTILS_CURL=y
+-CONFIG_UTILS_IPERF2=y
+ CONFIG_UTILS_SSH=y
+ CONFIG_VIDEO_FB=y
+ CONFIG_WIFI_TEST=y
+diff --git a/boards/r528/r528s3-gemini-s1/src/Makefile b/boards/r528/r528s3-gemini-s1/src/Makefile
+index cb00506e..8025431c 100644
+--- a/boards/r528/r528s3-gemini-s1/src/Makefile
++++ b/boards/r528/r528s3-gemini-s1/src/Makefile
+@@ -93,6 +93,7 @@ ifeq ($(CONFIG_MIDESS),y)
+ RCRAWS += etc/mi/ui_support.json
+ endif
+ 
++$(warning DEBUG_CHECK CONFIG_MEDIA_SERVER=$(CONFIG_MEDIA_SERVER) CONFIG_COMPONENTS_BLUETOOTH=$(CONFIG_COMPONENTS_BLUETOOTH))
+ ifeq ($(CONFIG_MEDIA_SERVER),y)
+ RCRAWS += etc/media
+ endif
+diff --git a/boards/r528/r528s3-gemini-s1/src/etc/media/criteria.txt b/boards/r528/r528s3-gemini-s1/src/etc/media/criteria.txt
+index 2f31b16c..eadca456 100644
+--- a/boards/r528/r528s3-gemini-s1/src/etc/media/criteria.txt
++++ b/boards/r528/r528s3-gemini-s1/src/etc/media/criteria.txt
+@@ -1,18 +1,28 @@
+-ExclusiveCriterion Music                   : abufsrc@Music
+-ExclusiveCriterion Ring Info Health        : abufsrc@Ring
+-ExclusiveCriterion Media                   : abufsrc@Media
+-ExclusiveCriterion Alarm                   : abufsrc@Alarm
+-ExclusiveCriterion Enforced                : abufsrc@Enforced
+-ExclusiveCriterion TTS                     : abufsrc@TTS
+-ExclusiveCriterion Sport                   : abufsrc@Sport
+-ExclusiveCriterion Notify                  : abufsrc@Notify
+-ExclusiveCriterion Capture                 : abufsink@Capture
+-ExclusiveCriterion AudioMode        : normal ringtone phone = normal
+-ExclusiveCriterion MicMode          : off on = on
+-InclusiveCriterion UsingDevices     : mic = mic
+-InclusiveCriterion AvailableDevices : spk
+-ExclusiveCriterion persist.media.MuteMode    MuteMode : off on = off
+-NumericalCriterion persist.media.MediaVolume RecordVolume TTSVolume MusicVolume MediaVolume : [0,10] = 6
+-NumericalCriterion persist.media.RingVolume  RingVolume NotifyVolume HealthVolume InfoVolume  : [0,10] = 6
+-NumericalCriterion persist.media.AlarmVolume AlarmVolume : [0,10] = 6
++InclusiveCriterion UsingDevices     : mic a2dpsnk = mic
++InclusiveCriterion ActiveStreams    : acap VOIPtx WWEtx MDStx
++ExclusiveCriterion Capture          : abufsink@acap
++ExclusiveCriterion Ring             : abufsrc@apb
++ExclusiveCriterion Music            : abufsrc@apb
++ExclusiveCriterion Alarm            : abufsrc@apb
++ExclusiveCriterion Video Video0     : movie_async@Video0
++ExclusiveCriterion VtunVideo Video1 : movie_async@Video1
++ExclusiveCriterion TalkCap          : amoviesink_async@acap
++ExclusiveCriterion VoipCap          : amoviesink_async@VOIPtx
++ExclusiveCriterion WWEtx            : amoviesink_async@WWEtx
++ExclusiveCriterion MDStx            : amoviesink_async@MDStx
++NumericalCriterion persist.media.AcapGain AcapGain : [1,10] = 10
++NumericalCriterion persist.media.AlarmVolume AlarmVolume : [0,20] = 10
++NumericalCriterion persist.media.A2dpsnkVolume A2dpsnkVolume RingVolume MusicVolume MediaVolume : [0,20] = 10
++ExclusiveCriterion VoiceChangeMode  : normal dashu xiaochou = normal
++ExclusiveCriterion persist.media.MuteMode MuteMode : off on = off
++NumericalCriterion persist.media.MediaVolume RecordVolume TTSVolume : [0,10] = 6
++NumericalCriterion persist.media.RingVolume NotifyVolume HealthVolume InfoVolume : [0,10] = 6
+ NumericalCriterion persist.media.SportVolume SportVolume : [0,10] = 6
++ExclusiveCriterion Media             : abufsrc@Media
++ExclusiveCriterion Enforced          : abufsrc@Enforced
++ExclusiveCriterion TTS               : abufsrc@TTS
++ExclusiveCriterion Sport             : abufsrc@Sport
++ExclusiveCriterion Notify            : abufsrc@Notify
++ExclusiveCriterion AudioMode         : normal ringtone phone = normal
++ExclusiveCriterion MicMode           : off on = on
++InclusiveCriterion AvailableDevices  : spk
+diff --git a/boards/r528/r528s3-gemini-s1/src/etc/media/graph.conf b/boards/r528/r528s3-gemini-s1/src/etc/media/graph.conf
+index bebc39af..2476504f 100644
+--- a/boards/r528/r528s3-gemini-s1/src/etc/media/graph.conf
++++ b/boards/r528/r528s3-gemini-s1/src/etc/media/graph.conf
+@@ -1,21 +1,5 @@
+-abufsrc@Music=outputs=1:map=1[Music0],
++adevsrc@pcm0c=format=nuttx:sample_rate=48000:ch_layout=stereo:devname=/dev/audio/pcm0c:map=1,volume@VolAcap=precision=fixed[acap0],
++[acap0]abufsink@acap;
+ 
+-abufsrc@Ring=outputs=1:map=1[Ring0],
+-
+-abufsrc@Alarm=outputs=1:map=1[Alarm0],
+-
+-abufsrc@Notify=outputs=1:map=1[Notify0],
+-
+-abufsrc@TTS=outputs=1:map=1[TTS0],
+-
+-abufsrc@Sport=outputs=1:map=1[Sport0],
+-
+-abufsrc@Media=outputs=1:map=1[Media0],
+-
+-abufsrc@Enforced=outputs=1:map=1[Enforced0],
+-
+-[Music0][Ring0][Alarm0][Notify0][TTS0][Sport0][Media0][Enforced0]alsasink@pcm0p=inputs=8:devname=pcm0p,
+-
+-alsasrc@pcm0c=devname=pcm0c:outputs=1:map=1[cap0],
+-
+-[cap0]abufsink@Capture=inputs=1
++abufsrc@apb=map=1,volume@VolApb=precision=fixed[apb0],
++[apb0]adevsink@pcm0p=format=nuttx:sample_rate=48000:ch_layout=stereo:devname=/dev/audio/pcm0p
+diff --git a/chips/r528/drivers/rtos-hal/hal/source/dma/hal_dma.c b/chips/r528/drivers/rtos-hal/hal/source/dma/hal_dma.c
+index 312ea340..ade66510 100644
+--- a/chips/r528/drivers/rtos-hal/hal/source/dma/hal_dma.c
++++ b/chips/r528/drivers/rtos-hal/hal/source/dma/hal_dma.c
+@@ -1036,7 +1036,8 @@ hal_dma_status_t hal_dma_start(struct sunxi_dma_chan *chan)
+ 
+ hal_dma_status_t hal_dma_stop(struct sunxi_dma_chan *chan)
+ {
+-    unsigned long __cpsr;
++    unsigned long __cpsr, __ccpsr;
++    uint32_t high, irq_val;
+ 
+     if (NULL == chan)
+     {
+@@ -1052,6 +1053,19 @@ hal_dma_status_t hal_dma_stop(struct sunxi_dma_chan *chan)
+     hal_writel(CHAN_STOP, DMA_ENABLE(chan->chan_count));
+     hal_writel(CHAN_RESUME, DMA_PAUSE(chan->chan_count));
+ 
++    /* Disable and clear this channel's DMA IRQ before teardown so a
++     * hardware-latched completion interrupt cannot re-enter
++     * sunxi_dma_irq_handle() and dereference a desc/callback that
++     * sunxi_dma_free_ill() is about to free (start path re-enables it).
++     */
++    high = (chan->chan_count + START_CHAN_OFFSET >= HIGH_CHAN) ? 1 : 0;
++    __ccpsr = hal_spin_lock_irqsave(&dma_lock);
++    irq_val = hal_readl(DMA_IRQ_EN(high));
++    irq_val &= ~(SHIFT_IRQ_MASK(chan->irq_type, chan->chan_count));
++    hal_writel(irq_val, DMA_IRQ_EN(high));
++    hal_writel(SHIFT_IRQ_MASK(chan->irq_type, chan->chan_count), DMA_IRQ_STAT(high));
++    hal_spin_unlock_irqrestore(&dma_lock, __ccpsr);
++
+     if (chan->cyclic)
+     {
+         chan->cyclic = false;
+diff --git a/chips/r528/drivers/rtos-hal/hal/source/sound/platform/sunxi-pcm.c b/chips/r528/drivers/rtos-hal/hal/source/sound/platform/sunxi-pcm.c
+index d4d7512f..d2661ae5 100644
+--- a/chips/r528/drivers/rtos-hal/hal/source/sound/platform/sunxi-pcm.c
++++ b/chips/r528/drivers/rtos-hal/hal/source/sound/platform/sunxi-pcm.c
+@@ -56,7 +56,7 @@ static const struct snd_pcm_hardware sunxi_pcm_hardware[2] = {
+ 					| SNDRV_PCM_INFO_PAUSE
+ 					| SNDRV_PCM_INFO_RESUME,
+ 		.buffer_bytes_max	= 1024 * 128,
+-		.period_bytes_min	= 256,
++		.period_bytes_min	= 128,
+ 		.period_bytes_max	= 1024 * 64,
+ 		.periods_min		= 2,
+ 		.periods_max		= 16,
+@@ -69,7 +69,7 @@ static const struct snd_pcm_hardware sunxi_pcm_hardware[2] = {
+ 					| SNDRV_PCM_INFO_PAUSE
+ 					| SNDRV_PCM_INFO_RESUME,
+ 		.buffer_bytes_max	= 1024 * 128,
+-		.period_bytes_min	= 256,
++		.period_bytes_min	= 128,
+ 		.period_bytes_max	= 1024 * 64,
+ 		.periods_min		= 2,
+ 		.periods_max		= 16,
